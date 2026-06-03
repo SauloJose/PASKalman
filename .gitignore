@@ -52,14 +52,26 @@ FiltroKalman/src/data/
 FiltroKalman/src/results/
 FiltroKalman/videos/
 Checklist_Projeto/
-Artigo do Projeto/
-Artigos Base/
+Artigo do Projeto/build 
+Artigo do Projeto/capitulos 
+Artigo do Projeto/Figuras
 *.mp4
 *.avi
 *.mkv
 *.mov
 *.csv
 *.log
+*.txt
+*.aux
+*.bbl 
+*.fdb_latexmk
+*.fls
+*.bbl
+*.out
+*.gz 
+*.tex 
+*.blg 
+*.bib 
 
 # OS
 Thumbs.db
