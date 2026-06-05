@@ -49,7 +49,6 @@ htmlcov/
 
 # Data & Resultados (Ajustado com / no final para garantir)
 FiltroKalman/src/data/
-FiltroKalman/src/results/
 FiltroKalman/videos/
 Checklist_Projeto/
 Artigo do Projeto/build 
