@@ -38,7 +38,7 @@ class KalmanApp:
         self.max_x = 150 #metros
         self.max_y = 100 #metros
 
-        self.min_window_m = 2 #metros
+        self.min_window_m = 3 #metros
 
         # Maximize window
         try:
@@ -69,6 +69,11 @@ class KalmanApp:
         self.sqerr_x = []
         self.sqerr_y = []
         self.kalman_windows = []  # Armazena as matrizes P de covariância
+        self.pred_pts = []          # posição predita (antes do update)
+        self.innovations = []       # diferença z - H*x_pred (2D)
+        self.nis_values = []        # inovação normalizada escalar
+        self.prior_covs = []        # covariância predita P_pred
+        self.measurements_raw = []  # medições em metros (para gráficos de dispersão)
 
         # Visualization toggle states
         self.show_traj = tk.BooleanVar(value=True)
@@ -127,7 +132,7 @@ class KalmanApp:
         ttk.Label(config_lbl_frame, text="Erro do Detector (Ruído em Pixels):", 
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 2))
         self.detector_noise_entry = ttk.Entry(config_lbl_frame, width=12)
-        self.detector_noise_entry.insert(0, "4.0")  # Valor padrão de ruído de pixel
+        self.detector_noise_entry.insert(0, "1.0")  # Valor padrão de ruído de pixel
         self.detector_noise_entry.pack(anchor="w", pady=(0, 8))
 
         # Q matrix diagonal inputs (6 values)
@@ -145,7 +150,7 @@ class KalmanApp:
             lbl = tk.Label(q_frame, text=label, font=("Segoe UI", 7), bg="#f5f5f5")
             lbl.grid(row=row*2, column=col, sticky="w", padx=2, pady=(2, 0))
             entry = ttk.Entry(q_frame, width=8)
-            entry.insert(0, "1e-2" if i < 2 else "1e-1")
+            entry.insert(0, "5e-1" if i < 2 else "1e-1")
             entry.grid(row=row*2+1, column=col, sticky="ew", padx=2, pady=(0, 4))
             self.q_entries.append(entry)
         q_frame.columnconfigure(0, weight=1)
@@ -165,7 +170,7 @@ class KalmanApp:
             lbl = tk.Label(r_frame, text=label, font=("Segoe UI", 7), bg="#f5f5f5")
             lbl.grid(row=0, column=i, sticky="w", padx=2, pady=(2, 0))
             entry = ttk.Entry(r_frame, width=10)
-            entry.insert(0, "1e-1")
+            entry.insert(0, "0.01")
             entry.grid(row=1, column=i, sticky="ew", padx=2, pady=(0, 2))
             self.r_entries.append(entry)
         r_frame.columnconfigure(0, weight=1)
@@ -493,62 +498,86 @@ class KalmanApp:
             
             dt = 1.0 / fps
             
-            # Uso da classe Entidy vinda de world.py no lugar do SixDModel ausente
             q_vals = self.config_Q if len(self.config_Q) >= 6 else self.config_Q + [1e-1] * (6 - len(self.config_Q))
             r_vals = self.config_R[:2] if len(self.config_R) >= 2 else self.config_R + [1e-1]
+
+            # Entidade 
             kf = Entidy(dt=dt, q_diag=q_vals[:6], r_diag=r_vals[:2])
             
+
+            self.saved_Q = kf.Q if hasattr(kf, 'Q') else np.diag(q_vals[:6])
+            self.saved_R = kf.R if hasattr(kf, 'R') else np.diag(r_vals[:2])
+
+
+            self.saved_Qd = getattr(kf, 'Qd', getattr(kf, 'Q_discrete', getattr(kf, 'Q_d', None)))
+
             frame_count = 0
-            valid_detections = 0  # Rastreador de quadros detectados estáveis
+            valid_detections = 0  # Agora contará apenas detecções DENTRO da janela
             
             self.meas_pts = []
             self.filt_pts = []
             self.sqerr_x = []
             self.sqerr_y = []
-            self.kalman_windows = []  
+            self.kalman_windows = []
+            self.nis_vals = []  # NOVO: Histórico do NIS
             
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                # Executa a detecção injetando o ruído dinâmico parametrizado na UI
                 meas_px = detect_centroid(frame, noise_std=self.config_detector_noise)
                 
-                # Conversão matemática: Converte os pixels medidos para metros antes de alimentar o Kalman
                 if meas_px is not None:
-                    valid_detections += 1
                     meas_m = self.world_m.img2world(meas_px[0], meas_px[1])
                 else:
                     meas_m = None
                 
                 kf.predict()
+                
                 if meas_m is not None:
                     kf.update(meas_m)
                 
-                # Coordenadas estimadas reais (em metros)
                 est_m = kf.get_position()
                 
-                # Salva a matriz de covariância a posteriori para a projeção da elipse/retângulo de incerteza
-                self.kalman_windows.append(kf.P.copy() if hasattr(kf, 'P') else None)
+                # Salva a matriz de covariância
+                P_mat = kf.P.copy() if hasattr(kf, 'P') else None
+                self.kalman_windows.append(P_mat)
                 
+                # Extração das variâncias para cálculo do NIS e da Janela
+                var_x = float(P_mat[0, 0]) if P_mat is not None else 1e-6
+                var_y = float(P_mat[1, 1]) if P_mat is not None else 1e-6
+                
+                std_x_m = max(self.min_window_m, np.sqrt(var_x) * 3)
+                std_y_m = max(self.min_window_m, np.sqrt(var_y) * 3)
+
                 if meas_m is None:
                     self.meas_pts.append(None)
                     self.sqerr_x.append(np.nan)
                     self.sqerr_y.append(np.nan)
+                    self.nis_vals.append(np.nan)
                 else:
                     mx, my = float(meas_m[0]), float(meas_m[1])
                     ex, ey = float(est_m[0]), float(est_m[1])
                     self.meas_pts.append((mx, my))
-                    self.sqerr_x.append((ex - mx) ** 2)
-                    self.sqerr_y.append((ey - my) ** 2)
+                    
+                    dx, dy = ex - mx, ey - my
+                    self.sqerr_x.append(dx ** 2)
+                    self.sqerr_y.append(dy ** 2)
+                    
+                    # Cálculo Aproximado do NIS (usando a posterior)
+                    nis = (dx**2 / var_x) + (dy**2 / var_y)
+                    self.nis_vals.append(nis)
+                    
+                    # NOVO: Conta como válido apenas se estiver dentro da janela de confiança 3-Sigma
+                    if abs(dx) <= std_x_m and abs(dy) <= std_y_m:
+                        valid_detections += 1
                 
                 self.filt_pts.append((float(est_m[0]), float(est_m[1])))
                 
                 # --- DESENHO DE ANOTAÇÕES EM PIXELS SOBRE A IMAGEM ---
                 ann = frame.copy()
                 
-                # Desenhar trajetória histórica (Convertendo metros -> pixels para desenhar)
                 if self.show_traj.get() and len(self.filt_pts) >= 2:
                     filt_poly = []
                     for pt_m in self.filt_pts:
@@ -556,11 +585,9 @@ class KalmanApp:
                             px, py = self.world_m.world2img(pt_m[0], pt_m[1])
                             filt_poly.append((px, py))
                     if len(filt_poly) >= 2:
-                        # CORREÇÃO AQUI: Adicionado o reshape
                         poly_array = np.array(filt_poly, dtype=np.int32).reshape((-1, 1, 2))
                         cv2.polylines(ann, [poly_array], False, YELLOW_COLOR, 2)
                 
-                # Desenhar histórico de detecção do sensor
                 if self.show_detect.get() and len(self.meas_pts) >= 2:
                     meas_poly = []
                     for pt_m in self.meas_pts:
@@ -568,56 +595,31 @@ class KalmanApp:
                             px, py = self.world_m.world2img(pt_m[0], pt_m[1])
                             meas_poly.append((px, py))
                     if len(meas_poly) >= 2:
-                        # CORREÇÃO AQUI: Adicionado o reshape
                         meas_array = np.array(meas_poly, dtype=np.int32).reshape((-1, 1, 2))
                         cv2.polylines(ann, [meas_array], False, GREEN_COLOR, 1)
                 
-                # Janela Dinâmica de Kalman (Mapeando a incerteza estatística de metros para pixels em cada frame)
-                if self.show_window.get() and frame_count < len(self.kalman_windows) and self.kalman_windows[frame_count] is not None:
-                    P_mat = self.kalman_windows[frame_count]
-                    
-                    # Variâncias em metros quadrados extraídas da diagonal de P
-                    var_x = float(P_mat[0, 0])
-                    var_y = float(P_mat[1, 1])
-                    
-                    # Desvio padrão de confiança ampliado (3-Sigma) em metros
-                    std_x_m = np.sqrt(var_x) * 3
-                    std_y_m = np.sqrt(var_y) * 3
-                    
-                    # Garante que a janela tenha NO MÍNIMO 5 metros de raio/margem
-                    # em torno do ponto central estimado, impedindo que ela suma na nova escala.
-                    std_x_m = max(self.min_window_m, std_x_m)
-                    std_y_m = max(self.min_window_m, std_y_m)
-                    
+                if self.show_window.get() and frame_count < len(self.kalman_windows) and P_mat is not None:
                     cx_m, cy_m = self.filt_pts[frame_count]
-                    
-                    # Converte os extremos da janela de metros para coordenadas invertidas de pixel na tela
                     px1, py1 = self.world_m.world2img(cx_m - std_x_m, cy_m + std_y_m)
                     px2, py2 = self.world_m.world2img(cx_m + std_x_m, cy_m - std_y_m)
                     
-                    # Restringe limites para evitar overflow fora da imagem
-                    px1_c = max(0, min(w, int(px1)))
-                    py1_c = max(0, min(h, int(py1)))
-                    px2_c = max(0, min(w, int(px2)))
-                    py2_c = max(0, min(h, int(py2)))
-                    
+                    px1_c, py1_c = max(0, min(w, int(px1))), max(0, min(h, int(py1)))
+                    px2_c, py2_c = max(0, min(w, int(px2))), max(0, min(h, int(py2)))
                     cv2.rectangle(ann, (px1_c, py1_c), (px2_c, py2_c), (255, 200, 0), 2)
                 
-                # Desenhar marcadores pontuais do frame atual (Convertendo metros -> pixels)
                 est_px = self.world_m.world2img(est_m[0], est_m[1])
                 if self.show_kalman.get():
                     center_est = (int(est_px[0]), int(est_px[1]))
                     cv2.circle(ann, center_est, 6, BLUE_COLOR, -1)
                 
                 if self.show_detect.get() and meas_px is not None:
-                    # Garante inteiros puros do Python para o OpenCV
                     center_px = (int(meas_px[0]), int(meas_px[1]))
                     cv2.circle(ann, center_px, 6, (255, 0, 0), -1)
                 
                 out.write(ann)
                 frame_count += 1
             
-            # Cálculo estatístico final da taxa de estabilidade de captura do detector
+            # Cálculo atualizado da taxa: Qual % do tempo do vídeo tivemos detecções estáveis (dentro da janela)
             self.detection_rate = (valid_detections / frame_count) * 100.0 if frame_count > 0 else 0.0
             
             self.processed_video_path = output_path
@@ -629,11 +631,196 @@ class KalmanApp:
         
         finally:
             self.processing = False
-            if cap is not None:
-                cap.release()
-            if out is not None:
-                out.release()
+            if cap is not None: cap.release()
+            if out is not None: out.release()
 
+
+    def save_results(self):
+        """Salva gráficos detalhados, relatório e dados brutos em CSV em src/results/"""
+        if not self.filt_pts or not self.meas_pts:
+            messagebox.showwarning("Aviso", "Nenhum resultado para salvar.")
+            return
+        
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "results"
+            
+            # Criar o diretório específico para o vídeo atual
+            save_dir = f"FiltroKalman/src/results/{video_name}"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            import matplotlib.pyplot as plt
+            from matplotlib.figure import Figure
+            import csv
+            import numpy as np # Garantir que numpy está disponível para a formatação
+            
+            # --- Preparação de Dados Estatísticos ---
+            dx_list = [np.sqrt(sx) if not np.isnan(sx) else np.nan for sx in self.sqerr_x]
+            dy_list = [np.sqrt(sy) if not np.isnan(sy) else np.nan for sy in self.sqerr_y]
+            
+            valid_dx = [x for x in dx_list if not np.isnan(x)]
+            valid_dy = [y for y in dy_list if not np.isnan(y)]
+            valid_nis = [n for n in self.nis_vals if not np.isnan(n)]
+            
+            # ===== GRÁFICO 1: TRAJETÓRIA REAL =====
+            fig1 = Figure(figsize=(12, 8), tight_layout=True, dpi=150)
+            ax1 = fig1.add_subplot(111)
+            xs_meas = [p[0] for p in self.meas_pts if p is not None]
+            ys_meas = [p[1] for p in self.meas_pts if p is not None]
+            xs_filt = [p[0] for p in self.filt_pts]
+            ys_filt = [p[1] for p in self.filt_pts]
+            
+            ax1.plot(xs_meas, ys_meas, "r.-", label="Medido", linewidth=1, markersize=4, alpha=0.5)
+            ax1.plot(xs_filt, ys_filt, "#333333", label="Kalman Filtrado", linewidth=2.5, alpha=0.9)
+            ax1.set_xlabel("Posição X (metros)", fontweight="bold")
+            ax1.set_ylabel("Posição Y (metros)", fontweight="bold")
+            ax1.set_title(f"Trajetória Espacial | Retenção na Janela: {self.detection_rate:.1f}%", fontweight="bold")
+            ax1.legend()
+            ax1.grid(True, alpha=0.3, linestyle="--")
+            fig1.savefig(f"{save_dir}/{video_name}_1_traj.png")
+            
+            # ===== GRÁFICO 2: RMS X e Y Acumulados =====
+            fig2 = Figure(figsize=(12, 6), tight_layout=True, dpi=150)
+            ax2 = fig2.add_subplot(111)
+            sx = np.array([v for v in self.sqerr_x if not np.isnan(v)])
+            sy = np.array([v for v in self.sqerr_y if not np.isnan(v)])
+            
+            if sx.size > 0 and sy.size > 0:
+                run_rms_x = np.sqrt(np.cumsum(sx) / np.arange(1, sx.size + 1))
+                run_rms_y = np.sqrt(np.cumsum(sy) / np.arange(1, sy.size + 1))
+                ax2.plot(run_rms_x, label="RMS X", color="blue")
+                ax2.plot(run_rms_y, label="RMS Y", color="orange")
+            ax2.set_xlabel("Frames", fontweight="bold")
+            ax2.set_ylabel("Erro RMS Acumulado (metros)", fontweight="bold")
+            ax2.set_title("Evolução do Erro RMS", fontweight="bold")
+            ax2.legend()
+            ax2.grid(True, alpha=0.3, linestyle="--")
+            fig2.savefig(f"{save_dir}/{video_name}_2_rms.png")
+            
+            # ===== GRÁFICO 3: DISPERSÃO (SCATTER) =====
+            fig3 = Figure(figsize=(8, 8), tight_layout=True, dpi=150)
+            ax3 = fig3.add_subplot(111)
+            ax3.scatter(valid_dx, valid_dy, alpha=0.5, c='purple', edgecolors='k', s=20)
+            ax3.axhline(0, color='black', linewidth=1)
+            ax3.axvline(0, color='black', linewidth=1)
+            ax3.set_xlabel("Erro X (m)", fontweight="bold")
+            ax3.set_ylabel("Erro Y (m)", fontweight="bold")
+            ax3.set_title("Dispersão do Erro de Estimação", fontweight="bold")
+            ax3.grid(True, alpha=0.3, linestyle="--")
+            fig3.savefig(f"{save_dir}/{video_name}_3_scatter.png")
+            
+            # ===== GRÁFICO 4: NIS (Normalized Innovation Squared) =====
+            fig4 = Figure(figsize=(12, 6), tight_layout=True, dpi=150)
+            ax4 = fig4.add_subplot(111)
+            frames = [i for i, n in enumerate(self.nis_vals) if not np.isnan(n)]
+            ax4.plot(frames, valid_nis, 'm-', alpha=0.7, label="NIS Calculado")
+            ax4.axhline(5.99, color='r', linestyle='--', linewidth=2, label="Limite 95% Confiança (Chi-quadrado)")
+            ax4.set_ylim(0, max(15, np.percentile(valid_nis, 95) * 1.5 if valid_nis else 15))
+            ax4.set_xlabel("Frames", fontweight="bold")
+            ax4.set_ylabel("Valor NIS", fontweight="bold")
+            ax4.set_title("Teste de Consistência NIS", fontweight="bold")
+            ax4.legend()
+            ax4.grid(True, alpha=0.3, linestyle="--")
+            fig4.savefig(f"{save_dir}/{video_name}_4_nis.png")
+            
+            # ===== GRÁFICO 5: HISTOGRAMA DOS ERROS =====
+            fig5 = Figure(figsize=(10, 6), tight_layout=True, dpi=150)
+            ax5 = fig5.add_subplot(111)
+            ax5.hist(valid_dx, bins=30, alpha=0.5, color='blue', label='Erros X (m)')
+            ax5.hist(valid_dy, bins=30, alpha=0.5, color='orange', label='Erros Y (m)')
+            ax5.set_xlabel("Magnitude do Erro (metros)", fontweight="bold")
+            ax5.set_ylabel("Frequência", fontweight="bold")
+            ax5.set_title("Histograma dos Erros de Estado", fontweight="bold")
+            ax5.legend()
+            ax5.grid(True, alpha=0.3, linestyle="--")
+            fig5.savefig(f"{save_dir}/{video_name}_5_hist.png")
+            
+            # Fechamento de memória do matplotlib
+            plt.close(fig1); plt.close(fig2); plt.close(fig3); plt.close(fig4); plt.close(fig5)
+            
+            # ===== GERAR TXT COM RESUMO DE MÉTRICAS =====
+            rmse_x_total = np.sqrt(np.nanmean(self.sqerr_x)) if self.sqerr_x else 0.0
+            rmse_y_total = np.sqrt(np.nanmean(self.sqerr_y)) if self.sqerr_y else 0.0
+            mean_nis = np.mean(valid_nis) if valid_nis else 0.0
+            nis_above_95 = sum(1 for n in valid_nis if n > 5.99)
+            nis_pct_above = (nis_above_95 / len(valid_nis)) * 100 if valid_nis else 0.0
+            max_err_x = np.max(valid_dx) if valid_dx else 0.0
+            max_err_y = np.max(valid_dy) if valid_dy else 0.0
+            
+            txt_path = f"{save_dir}/{video_name}_metrics.txt"
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("====================================================\n")
+                f.write("      RESUMO DE MÉTRICAS - FILTRO DE KALMAN         \n")
+                f.write("====================================================\n\n")
+                f.write(f"Arquivo Fonte: {self.video_path}\n")
+                f.write(f"Data da Análise: {time.strftime('%d/%m/%Y %H:%M:%S')}\n\n")
+                
+                # --- NOVO: BLOCO DAS MATRIZES ---
+                f.write("--- PARÂMETROS DO FILTRO ---\n")
+                
+                # Formatação elegante para matrizes numpy
+                fmt_opts = {'precision': 6, 'suppress_small': True, 'separator': '  '}
+                
+                if hasattr(self, 'saved_Q') and self.saved_Q is not None:
+                    f.write("Matriz de Ruído de Processo Contínuo (Q):\n")
+                    f.write(f"{np.array2string(np.array(self.saved_Q), **fmt_opts)}\n\n")
+                
+                if hasattr(self, 'saved_Qd') and self.saved_Qd is not None:
+                    f.write("Matriz de Ruído de Processo Discretizada (Qd):\n")
+                    f.write(f"{np.array2string(np.array(self.saved_Qd), **fmt_opts)}\n\n")
+                else:
+                    f.write("Matriz de Ruído de Processo Discretizada (Qd): [Não Disponível/Não Calculada]\n\n")
+                
+                if hasattr(self, 'saved_R') and self.saved_R is not None:
+                    f.write("Matriz de Ruído de Medição (R):\n")
+                    f.write(f"{np.array2string(np.array(self.saved_R), **fmt_opts)}\n\n")
+                
+                f.write("----------------------------------------------------\n\n")
+
+                f.write("--- RETENÇÃO DE DETECÇÃO ---\n")
+                f.write(f"Taxa de Detecção Estável (Na janela de incerteza): {self.detection_rate:.2f}%\n\n")
+                
+                f.write("--- ERROS ABSOLUTOS E RMS (Metros) ---\n")
+                f.write(f"RMSE X (Raiz do Erro Quadrático Médio): {rmse_x_total:.4f} m\n")
+                f.write(f"RMSE Y (Raiz do Erro Quadrático Médio): {rmse_y_total:.4f} m\n")
+                f.write(f"Erro Máximo Registrado em X: {max_err_x:.4f} m\n")
+                f.write(f"Erro Máximo Registrado em Y: {max_err_y:.4f} m\n\n")
+                
+                f.write("--- AVALIAÇÃO DE CONSISTÊNCIA (NIS) ---\n")
+                f.write(f"NIS Médio (Ideal próximo aos graus de liberdade, ex: 2): {mean_nis:.4f}\n")
+                f.write(f"Leituras que excederam limite 95% (5.99): {nis_pct_above:.2f}%\n")
+                f.write(" * Nota: O NIS avalia se a covariância reflete a real incerteza do modelo.\n")
+                f.write("   Uma porcentagem acima de ~5% no limite indica que o filtro está subestimando\n")
+                f.write("   o ruído ou divergindo levemente.\n\n")
+                f.write("====================================================\n")
+
+            # ===== EXPORTAÇÃO PARA CSV =====
+            csv_path = f"{save_dir}/{video_name}_positions_{timestamp}.csv"
+            with open(csv_path, mode='w', newline='', encoding='utf-8') as f_csv:
+                writer = csv.writer(f_csv, delimiter=',')
+                # Cabeçalhos do CSV
+                writer.writerow(["Frame", "Meas_X(m)", "Meas_Y(m)", "Filt_X(m)", "Filt_Y(m)"])
+                
+                # Zip garante a sincronia entre a lista de medições e a de filtro por frame
+                for frame_idx, (m_pt, f_pt) in enumerate(zip(self.meas_pts, self.filt_pts)):
+                    # Formata para 4 casas decimais ou deixa vazio caso não haja medição (None)
+                    mx = f"{m_pt[0]:.4f}" if m_pt is not None else ""
+                    my = f"{m_pt[1]:.4f}" if m_pt is not None else ""
+                    
+                    fx = f"{f_pt[0]:.4f}" if f_pt is not None else ""
+                    fy = f"{f_pt[1]:.4f}" if f_pt is not None else ""
+                    
+                    writer.writerow([frame_idx, mx, my, fx, fy])
+            
+            messagebox.showinfo("Sucesso", f"Análise completa e arquivo .csv salvos em:\n{save_dir}/")
+            
+        except Exception as e:
+            error_msg = traceback.format_exc()
+            self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao gerar relatórios: {error_msg}"))
+        
+        finally:
+            self.processing = False
+            
     def _on_processing_complete(self):
         """Seletor de interface chamado ao finalizar o processamento."""
         self.status_lbl.config(text=f"Status: Concluído | Detecção: {self.detection_rate:.1f}%")
@@ -658,72 +845,6 @@ class KalmanApp:
             self.save_btn.config(state="normal")
             
             self._update_metrics_plots()
-
-    def save_results(self):
-        """Salva gráficos detalhados escalonados em METROS em src/results/"""
-        if not self.filt_pts or not self.meas_pts:
-            messagebox.showwarning("Aviso", "Nenhum resultado para salvar.")
-            return
-        
-        try:
-            os.makedirs("FiltroKalman/src/results", exist_ok=True)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "results"
-            
-            # ===== GRÁFICO 1: TRAJETÓRIA REAL =====
-            fig1 = Figure(figsize=(14, 10), tight_layout=True, dpi=150)
-            ax1 = fig1.add_subplot(111)
-            
-            xs_meas = [p[0] for p in self.meas_pts if p is not None]
-            ys_meas = [p[1] for p in self.meas_pts if p is not None]
-            xs_filt = [p[0] for p in self.filt_pts]
-            ys_filt = [p[1] for p in self.filt_pts]
-            
-            ax1.plot(xs_meas, ys_meas, "r.-", label="Medido (Detector em metros)", linewidth=2, markersize=4, alpha=0.7)
-            ax1.plot(xs_filt, ys_filt, "#333333", label="Filtrado (Kalman em metros)", linewidth=2.5, alpha=0.9)
-            
-            ax1.set_xlabel("Posição Real X (metros)", fontsize=12, fontweight="bold")
-            ax1.set_ylabel("Posição Real Y (metros)", fontsize=12, fontweight="bold")
-            ax1.set_title(f"Trajetória Espacial (Metros) - Detecção Estável: {self.detection_rate:.1f}%", fontsize=14, fontweight="bold", pad=20)
-            ax1.legend(fontsize=11, loc="best", framealpha=0.95)
-            ax1.grid(True, alpha=0.3, linestyle="--")
-            ax1.set_facecolor("#f5f5f5")
-            
-            path1 = f"FiltroKalman/src/results/{video_name}_traj_{timestamp}.png"
-            fig1.savefig(path1, dpi=150, bbox_inches="tight")
-            
-            # ===== GRÁFICO 2: RMS X =====
-            fig2 = Figure(figsize=(14, 7), tight_layout=True, dpi=150)
-            ax2 = fig2.add_subplot(111)
-            
-            sx = np.array([v for v in self.sqerr_x if not (v is None or np.isnan(v))], dtype=float)
-            if sx.size > 0:
-                running_mean_x = np.cumsum(sx) / np.arange(1, sx.size + 1)
-                running_rms_x = np.sqrt(running_mean_x)
-                ax2.plot(range(len(running_rms_x)), running_rms_x, "#333333", linewidth=2.5, label="RMS X")
-                ax2.fill_between(range(len(running_rms_x)), running_rms_x, alpha=0.2, color="#cccccc")
-            
-            ax2.set_xlabel("Índice do Frame", fontsize=12, fontweight="bold")
-            ax2.set_ylabel("Erro RMS Acumulado (metros)", fontsize=12, fontweight="bold")
-            ax2.set_title("Evolução Temporal do Erro RMS em X (Metros)", fontsize=14, fontweight="bold", pad=20)
-            ax2.grid(True, alpha=0.3, linestyle="--")
-            
-            path2 = f"FiltroKalman/src/results/{video_name}_rms_x_{timestamp}.png"
-            fig2.savefig(path2, dpi=150, bbox_inches="tight")
-            
-            # Fechar figuras
-            import matplotlib.pyplot as plt
-            plt.close(fig1)
-            plt.close(fig2)
-            
-            messagebox.showinfo("Sucesso", f"Gráficos salvos com sucesso em escala métrica real!")
-            
-        except Exception as e:
-            error_msg = traceback.format_exc()
-            self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao processar: {error_msg}"))
-        
-        finally:
-            self.processing = False
 
     def toggle_playback(self):
         if not self.cap:

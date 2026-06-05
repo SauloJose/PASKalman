@@ -5,7 +5,7 @@ import os
 
 # --- Configurações do Vídeo ---
 largura, altura = 640, 480
-fps = 30
+fps = 60
 duracao_por_trajetoria = 10  # segundos por trajetória
 frames_por_traj = fps * duracao_por_trajetoria
 
@@ -206,3 +206,6 @@ for traj_idx in range(num_trajetorias):
 print("=" * 60)
 print(f"✅ Todos os {num_trajetorias} vídeos foram gerados com sucesso!")
 print("=" * 60)
+
+
+
