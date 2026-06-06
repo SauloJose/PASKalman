@@ -47,6 +47,7 @@ class World:
         return int(px), int(py)
 
 
+
 # Classe para representar uma entidade do detector
 class Entidy:
     """
@@ -69,52 +70,35 @@ class Entidy:
             [0, 0, 0, 0, 0, 1]
         ], dtype=float)
 
-        # Matriz de observação
+        # Measurement matrix (we measure x, y only)
         self.H = np.array([
             [1, 0, 0, 0, 0, 0],
             [0, 1, 0, 0, 0, 0]
         ], dtype=float)
 
+        # Covariância do processo Q
         if q_diag is not None:
-            Qc = np.diag(np.array(q_diag, dtype=float))
+            self.Q = np.diag(np.array(q_diag, dtype=float))
         else:
-            Qc = np.diag([1e-3, 1e-3, 1e-2, 1e-2, 1e-1, 1e-1])
-
-        # Aproximação generalista de Primeira Ordem para a discretização de Qc
-        # Qd = Fd * (Qc * dt) * Fd^T
-        self.Qd = self.F.dot(Qc * self.dt).dot(self.F.T)
+            self.Q = np.eye(6) * 1e-2
         
+        # Covariância discretizada do Processo 
+        # Essa aproximação é devido ao pequeno tempo de propagação dos erros.
+        self.Qd = self.Q * self.dt
+
+
+        # Measurement covariance
         if r_diag is not None:
             self.R = np.diag(np.array(r_diag, dtype=float))
         else:
             self.R = np.eye(2) * 1e-1
         
-        # Covariância do estado
+        # State covariance
         self.P = np.eye(6) * 500.0 if initial_P == None else initial_P
         
-        # Vetor de estados
+        # State vector
         self.x = np.zeros((6, 1), dtype=float)
         self.initialized = False
-
-    def _g(self, x_state):
-        """ Função generalizada de transição de estado g(x) do EKF """
-        # Como o sistema é linear, g(x) = F * x
-        return self.F.dot(x_state)
-
-    def _jacobian_G(self, x_state):
-        """ Matriz Jacobiana da função de transição (G = dg/dx) """
-        # A derivada parcial de F*x em relação a x é a própria matriz constante F
-        return self.F.copy()
-
-    def _h(self, x_state):
-        """ Função generalizada de medição h(x) do EKF """
-        # Como a medição é afim, h(x) = H * x
-        return self.H.dot(x_state)
-
-    def _jacobian_H(self, x_state):
-        """ Matriz Jacobiana da função de medição (H_jac = dh/dx) """
-        # A derivada parcial de H*x em relação a x é a própria matriz constante H
-        return self.H.copy()
 
     def initialize(self, meas):
         """
@@ -134,13 +118,9 @@ class Entidy:
         
     # Predição da posição da entidade
     def predict(self):
-        # --- Passo EKF: Obtenção da matriz Jacobiana baseada no estado atual ---
-        G_jac = self._jacobian_G(self.x)
-        
         # Atualizando a crença a priori da entidade (belief)
-        # Substituído a multiplicação direta F.dot pela função g(x) do EKF
-        self.x = self._g(self.x)
-        self.P = G_jac.dot(self.P).dot(G_jac.T) + self.Qd
+        self.x = self.F.dot(self.x)
+        self.P = self.F.dot(self.P).dot(self.F.T) + self.Qd
 
     # Atualização da posição da entidade
     def update(self, meas):
@@ -150,27 +130,22 @@ class Entidy:
         if not self.initialized:
             self.initialize(z)
             return 
-            
-        # --- Passo EKF: Obtenção da matriz Jacobiana de medição ---
-        H_jac = self._jacobian_H(self.x)
         
         # Inovação
-        # Substituído H.dot pela função não-linear h(x)
-        y = z - self._h(self.x)
+        y = z - self.H.dot(self.x)
 
         # covariância da Inovação 
-        # Utiliza-se a matriz Jacobiana H_jac do EKF
-        S = H_jac.dot(self.P).dot(H_jac.T) + self.R
+        S = self.H.dot(self.P).dot(self.H.T) + self.R
 
         # Ganho de Kalman (garante a minimização do erro quadrático médio)
-        K = self.P.dot(H_jac.T).dot(np.linalg.inv(S))
+        K = self.P.dot(self.H.T).dot(np.linalg.inv(S))
 
         ## Atualização da Crença a posteriori da entidade belief()
         # Atualização do estado e da predição (u_x)
         self.x = self.x + K.dot(y)
         
         # Atualização da covariância interna do estado
-        self.P = (np.eye(6) - K.dot(H_jac)).dot(self.P)
+        self.P = (np.eye(6) - K.dot(self.H)).dot(self.P)
 
 
     def get_state(self):
@@ -181,6 +156,8 @@ class Entidy:
     def get_position(self):
         """ Puxo a posição [x,y]"""
         return self.x[:2].reshape(2,)
+
+    # --- NOVOS MÉTODOS ADICIONADOS ---
 
     def __str__(self):
         """Retorna uma linha de resumo rápido do estado atual do objeto."""
@@ -203,7 +180,7 @@ class Entidy:
         cinemáticos e estatísticos obtidos pelo Filtro de Kalman.
         """
         print("\n" + "="*55)
-        print("               RELATÓRIO DE TELEMETRIA (EKF)           ")
+        print("               RELATÓRIO DE TELEMETRIA (KALMAN)        ")
         print("="*55)
         
         if not self.initialized:

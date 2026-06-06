@@ -71,4 +71,4 @@ def detect_bot(frame, noise_std=3.0, towers: np.ndarray = None):
     return (cX, cY)
 
 def detect_color_orange(frame, noise_std=0.0):
-    return detect_centroid(frame, noise_std)
+    return detect_bot(frame, noise_std)
