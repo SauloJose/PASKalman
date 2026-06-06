@@ -6,8 +6,10 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
+import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import csv 
 
 # Importando as classes corrigidas diretamente do seu arquivo world.py
 from src.models.world import World, Entidy
@@ -482,72 +484,89 @@ class KalmanApp:
         try:
             cap = cv2.VideoCapture(self.video_path)
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            self.fps = fps  # guarda para uso posterior
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            # Create output directory
             os.makedirs("FiltroKalman/src/data", exist_ok=True)
-            
-            # Output video
             output_path = "FiltroKalman/src/data/output.mp4"
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
             
-            # Instanciação da classe World para conversões pixel <-> metro
             self.world_m = World(dimPX=w, dimPY=h, dimPOX=self.max_x, dimPOY=self.max_y)
-            
             dt = 1.0 / fps
             
             q_vals = self.config_Q if len(self.config_Q) >= 6 else self.config_Q + [1e-1] * (6 - len(self.config_Q))
             r_vals = self.config_R[:2] if len(self.config_R) >= 2 else self.config_R + [1e-1]
 
-            # Entidade 
             kf = Entidy(dt=dt, q_diag=q_vals[:6], r_diag=r_vals[:2])
             
-
             self.saved_Q = kf.Q if hasattr(kf, 'Q') else np.diag(q_vals[:6])
             self.saved_R = kf.R if hasattr(kf, 'R') else np.diag(r_vals[:2])
-
-
             self.saved_Qd = getattr(kf, 'Qd', getattr(kf, 'Q_discrete', getattr(kf, 'Q_d', None)))
 
             frame_count = 0
-            valid_detections = 0  # Agora contará apenas detecções DENTRO da janela
-            
+            frames_with_meas = 0        # frames em que houve alguma medição
+            valid_detections = 0        # medições dentro da janela 3-sigma
+
             self.meas_pts = []
             self.filt_pts = []
             self.sqerr_x = []
             self.sqerr_y = []
             self.kalman_windows = []
-            self.nis_vals = []  # NOVO: Histórico do NIS
-            
+            self.nis_vals = []
+            self.innov_x = []           # inovação em X (medição - predição)
+            self.innov_y = []           # inovação em Y
+
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
                 meas_px = detect_centroid(frame, noise_std=self.config_detector_noise)
+                meas_m = self.world_m.img2world(meas_px[0], meas_px[1]) if meas_px is not None else None
                 
-                if meas_px is not None:
-                    meas_m = self.world_m.img2world(meas_px[0], meas_px[1])
-                else:
-                    meas_m = None
-                
+                # Predição e guarda do estado predito
                 kf.predict()
-                
+                pos_pred = kf.get_position()  # ou kf.x[0:2].copy()
+                P_pred = kf.P.copy() if hasattr(kf, 'P') else None
+
                 if meas_m is not None:
+                    # Inovação (medição - predição)
+                    innov = np.array([meas_m[0] - pos_pred[0], meas_m[1] - pos_pred[1]])
+                    self.innov_x.append(innov[0])
+                    self.innov_y.append(innov[1])
+
+                    # Covariância da inovação: S = H*P_pred*H' + R
+                    # Como H é [I_2x2, 0], S = P_pred[0:2,0:2] + R
+                    if P_pred is not None:
+                        S = P_pred[:2, :2] + np.diag(r_vals[:2])
+                        # NIS = innov' * inv(S) * innov
+                        try:
+                            invS = np.linalg.inv(S)
+                            nis = innov @ invS @ innov
+                        except np.linalg.LinAlgError:
+                            nis = np.nan
+                    else:
+                        nis = np.nan
+                    self.nis_vals.append(nis)
+
+                    # Atualização
                     kf.update(meas_m)
-                
+                    frames_with_meas += 1
+                else:
+                    self.innov_x.append(np.nan)
+                    self.innov_y.append(np.nan)
+                    self.nis_vals.append(np.nan)
+
+                # Estado estimado (posterior)
                 est_m = kf.get_position()
-                
-                # Salva a matriz de covariância
                 P_mat = kf.P.copy() if hasattr(kf, 'P') else None
                 self.kalman_windows.append(P_mat)
-                
-                # Extração das variâncias para cálculo do NIS e da Janela
+
+                # Variâncias para janela de confiança
                 var_x = float(P_mat[0, 0]) if P_mat is not None else 1e-6
                 var_y = float(P_mat[1, 1]) if P_mat is not None else 1e-6
-                
                 std_x_m = max(self.min_window_m, np.sqrt(var_x) * 3)
                 std_y_m = max(self.min_window_m, np.sqrt(var_y) * 3)
 
@@ -555,85 +574,80 @@ class KalmanApp:
                     self.meas_pts.append(None)
                     self.sqerr_x.append(np.nan)
                     self.sqerr_y.append(np.nan)
-                    self.nis_vals.append(np.nan)
                 else:
                     mx, my = float(meas_m[0]), float(meas_m[1])
                     ex, ey = float(est_m[0]), float(est_m[1])
                     self.meas_pts.append((mx, my))
-                    
                     dx, dy = ex - mx, ey - my
                     self.sqerr_x.append(dx ** 2)
                     self.sqerr_y.append(dy ** 2)
-                    
-                    # Cálculo Aproximado do NIS (usando a posterior)
-                    nis = (dx**2 / var_x) + (dy**2 / var_y)
-                    self.nis_vals.append(nis)
-                    
-                    # NOVO: Conta como válido apenas se estiver dentro da janela de confiança 3-Sigma
+
+                    # Contagem de inliers (dentro da janela 3-sigma)
                     if abs(dx) <= std_x_m and abs(dy) <= std_y_m:
                         valid_detections += 1
-                
-                self.filt_pts.append((float(est_m[0]), float(est_m[1])))
-                
-                # --- DESENHO DE ANOTAÇÕES EM PIXELS SOBRE A IMAGEM ---
+
+                self.filt_pts.append((ex, ey))
+
+                # --- Desenho das anotações (código original mantido) ---
                 ann = frame.copy()
-                
                 if self.show_traj.get() and len(self.filt_pts) >= 2:
-                    filt_poly = []
-                    for pt_m in self.filt_pts:
-                        if pt_m is not None:
-                            px, py = self.world_m.world2img(pt_m[0], pt_m[1])
-                            filt_poly.append((px, py))
+                    filt_poly = [self.world_m.world2img(p[0], p[1]) for p in self.filt_pts if p is not None]
                     if len(filt_poly) >= 2:
-                        poly_array = np.array(filt_poly, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(ann, [poly_array], False, YELLOW_COLOR, 2)
-                
+                        cv2.polylines(ann, [np.array(filt_poly, dtype=np.int32)], False, YELLOW_COLOR, 2)
+
                 if self.show_detect.get() and len(self.meas_pts) >= 2:
-                    meas_poly = []
-                    for pt_m in self.meas_pts:
-                        if pt_m is not None:
-                            px, py = self.world_m.world2img(pt_m[0], pt_m[1])
-                            meas_poly.append((px, py))
+                    meas_poly = [self.world_m.world2img(p[0], p[1]) for p in self.meas_pts if p is not None]
                     if len(meas_poly) >= 2:
-                        meas_array = np.array(meas_poly, dtype=np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(ann, [meas_array], False, GREEN_COLOR, 1)
-                
+                        cv2.polylines(ann, [np.array(meas_poly, dtype=np.int32)], False, GREEN_COLOR, 1)
+
                 if self.show_window.get() and frame_count < len(self.kalman_windows) and P_mat is not None:
                     cx_m, cy_m = self.filt_pts[frame_count]
                     px1, py1 = self.world_m.world2img(cx_m - std_x_m, cy_m + std_y_m)
                     px2, py2 = self.world_m.world2img(cx_m + std_x_m, cy_m - std_y_m)
-                    
-                    px1_c, py1_c = max(0, min(w, int(px1))), max(0, min(h, int(py1)))
-                    px2_c, py2_c = max(0, min(w, int(px2))), max(0, min(h, int(py2)))
-                    cv2.rectangle(ann, (px1_c, py1_c), (px2_c, py2_c), (255, 200, 0), 2)
-                
-                est_px = self.world_m.world2img(est_m[0], est_m[1])
+                    cv2.rectangle(ann, 
+                                  (max(0, min(w, int(px1))), max(0, min(h, int(py1)))),
+                                  (max(0, min(w, int(px2))), max(0, min(h, int(py2)))),
+                                  (255, 200, 0), 2)
+
+                est_px = self.world_m.world2img(ex, ey)
                 if self.show_kalman.get():
-                    center_est = (int(est_px[0]), int(est_px[1]))
-                    cv2.circle(ann, center_est, 6, BLUE_COLOR, -1)
-                
+                    cv2.circle(ann, (int(est_px[0]), int(est_px[1])), 6, BLUE_COLOR, -1)
+
                 if self.show_detect.get() and meas_px is not None:
-                    center_px = (int(meas_px[0]), int(meas_px[1]))
-                    cv2.circle(ann, center_px, 6, (255, 0, 0), -1)
-                
+                    cv2.circle(ann, (int(meas_px[0]), int(meas_px[1])), 6, (255, 0, 0), -1)
+
                 out.write(ann)
                 frame_count += 1
-            
-            # Cálculo atualizado da taxa: Qual % do tempo do vídeo tivemos detecções estáveis (dentro da janela)
-            self.detection_rate = (valid_detections / frame_count) * 100.0 if frame_count > 0 else 0.0
-            
+
+            # Taxas de detecção e inliers
+            self.total_frames = frame_count
+            self.detection_rate = (frames_with_meas / frame_count * 100.0) if frame_count > 0 else 0.0
+            self.inlier_rate = (valid_detections / frames_with_meas * 100.0) if frames_with_meas > 0 else 0.0
+
             self.processed_video_path = output_path
             self.root.after(0, self._on_processing_complete)
-        
+
         except Exception as e:
             errorMsg = str(e)
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao processar: {errorMsg}"))
-        
         finally:
             self.processing = False
             if cap is not None: cap.release()
             if out is not None: out.release()
 
+    def _find_convergence_frame(self, running_rms, final_val, tol=0.05, min_stable=10):
+        """
+        Retorna o índice (em frames válidos) em que o running RMS fica consistentemente
+        <= (final_val * (1 + tol)) por pelo menos min_stable pontos consecutivos.
+        """
+        if final_val is None or len(running_rms) < min_stable:
+            return None
+        threshold = final_val * (1 + tol)
+        start = max(1, len(running_rms) // 5)  # ignora os primeiros 20%
+        for i in range(start, len(running_rms) - min_stable + 1):
+            if all(v <= threshold for v in running_rms[i:i+min_stable]):
+                return i
+        return None
 
     def save_results(self):
         """Salva gráficos detalhados, relatório e dados brutos em CSV em src/results/"""
@@ -644,183 +658,209 @@ class KalmanApp:
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "results"
-            
-            # Criar o diretório específico para o vídeo atual
             save_dir = f"FiltroKalman/src/results/{video_name}"
             os.makedirs(save_dir, exist_ok=True)
             
-            import matplotlib.pyplot as plt
-            from matplotlib.figure import Figure
-            import csv
-            import numpy as np # Garantir que numpy está disponível para a formatação
-            
-            # --- Preparação de Dados Estatísticos ---
-            dx_list = [np.sqrt(sx) if not np.isnan(sx) else np.nan for sx in self.sqerr_x]
-            dy_list = [np.sqrt(sy) if not np.isnan(sy) else np.nan for sy in self.sqerr_y]
-            
-            valid_dx = [x for x in dx_list if not np.isnan(x)]
-            valid_dy = [y for y in dy_list if not np.isnan(y)]
+            # ========== Preparação de dados ==========
+            # Erros assinados (filtrado - medido) para análise de viés e dispersão
+            signed_dx = []
+            signed_dy = []
+            for m_pt, f_pt in zip(self.meas_pts, self.filt_pts):
+                if m_pt is not None:
+                    signed_dx.append(f_pt[0] - m_pt[0])
+                    signed_dy.append(f_pt[1] - m_pt[1])
+
+            # Erros absolutos e RMS
+            dx_abs = [abs(e) for e in signed_dx]
+            dy_abs = [abs(e) for e in signed_dy]
+            # NIS válidos (já corrigidos)
             valid_nis = [n for n in self.nis_vals if not np.isnan(n)]
-            
-            # ===== GRÁFICO 1: TRAJETÓRIA REAL =====
+
+            # Running RMS para análise de convergência
+            sx = np.array([v for v in self.sqerr_x if not np.isnan(v)])
+            sy = np.array([v for v in self.sqerr_y if not np.isnan(v)])
+            run_rms_x = np.sqrt(np.cumsum(sx) / np.arange(1, sx.size + 1)) if sx.size > 0 else []
+            run_rms_y = np.sqrt(np.cumsum(sy) / np.arange(1, sy.size + 1)) if sy.size > 0 else []
+
+            # ===== GRÁFICO 1: TRAJETÓRIA =====
             fig1 = Figure(figsize=(12, 8), tight_layout=True, dpi=150)
             ax1 = fig1.add_subplot(111)
             xs_meas = [p[0] for p in self.meas_pts if p is not None]
             ys_meas = [p[1] for p in self.meas_pts if p is not None]
             xs_filt = [p[0] for p in self.filt_pts]
             ys_filt = [p[1] for p in self.filt_pts]
-            
             ax1.plot(xs_meas, ys_meas, "r.-", label="Medido", linewidth=1, markersize=4, alpha=0.5)
             ax1.plot(xs_filt, ys_filt, "#333333", label="Kalman Filtrado", linewidth=2.5, alpha=0.9)
             ax1.set_xlabel("Posição X (metros)", fontweight="bold")
             ax1.set_ylabel("Posição Y (metros)", fontweight="bold")
-            ax1.set_title(f"Trajetória Espacial | Retenção na Janela: {self.detection_rate:.1f}%", fontweight="bold")
+            ax1.set_title(f"Trajetória Espacial | Detecções: {self.detection_rate:.1f}% | Inliers: {self.inlier_rate:.1f}%", fontweight="bold")
             ax1.legend()
             ax1.grid(True, alpha=0.3, linestyle="--")
             fig1.savefig(f"{save_dir}/{video_name}_1_traj.png")
-            
-            # ===== GRÁFICO 2: RMS X e Y Acumulados =====
+
+            # ===== GRÁFICO 2: RMS ACUMULADO + CONVERGÊNCIA =====
             fig2 = Figure(figsize=(12, 6), tight_layout=True, dpi=150)
             ax2 = fig2.add_subplot(111)
-            sx = np.array([v for v in self.sqerr_x if not np.isnan(v)])
-            sy = np.array([v for v in self.sqerr_y if not np.isnan(v)])
-            
-            if sx.size > 0 and sy.size > 0:
-                run_rms_x = np.sqrt(np.cumsum(sx) / np.arange(1, sx.size + 1))
-                run_rms_y = np.sqrt(np.cumsum(sy) / np.arange(1, sy.size + 1))
+            if len(run_rms_x) > 0:
                 ax2.plot(run_rms_x, label="RMS X", color="blue")
                 ax2.plot(run_rms_y, label="RMS Y", color="orange")
+                # Marca pontos de convergência
+                final_x = run_rms_x[-1] if len(run_rms_x) > 0 else None
+                final_y = run_rms_y[-1] if len(run_rms_y) > 0 else None
+                conv_idx_x = self._find_convergence_frame(run_rms_x, final_x)
+                conv_idx_y = self._find_convergence_frame(run_rms_y, final_y)
+                if conv_idx_x is not None:
+                    ax2.axvline(conv_idx_x, color='blue', linestyle=':', alpha=0.7,
+                                label=f"Conv. X: {conv_idx_x/self.fps:.2f}s")
+                if conv_idx_y is not None:
+                    ax2.axvline(conv_idx_y, color='orange', linestyle=':', alpha=0.7,
+                                label=f"Conv. Y: {conv_idx_y/self.fps:.2f}s")
             ax2.set_xlabel("Frames", fontweight="bold")
             ax2.set_ylabel("Erro RMS Acumulado (metros)", fontweight="bold")
             ax2.set_title("Evolução do Erro RMS", fontweight="bold")
             ax2.legend()
             ax2.grid(True, alpha=0.3, linestyle="--")
             fig2.savefig(f"{save_dir}/{video_name}_2_rms.png")
-            
-            # ===== GRÁFICO 3: DISPERSÃO (SCATTER) =====
+
+            # ===== GRÁFICO 3: DISPERSÃO (ERROS ASSINADOS) =====
             fig3 = Figure(figsize=(8, 8), tight_layout=True, dpi=150)
             ax3 = fig3.add_subplot(111)
-            ax3.scatter(valid_dx, valid_dy, alpha=0.5, c='purple', edgecolors='k', s=20)
+            ax3.scatter(signed_dx, signed_dy, alpha=0.5, c='purple', edgecolors='k', s=20)
             ax3.axhline(0, color='black', linewidth=1)
             ax3.axvline(0, color='black', linewidth=1)
             ax3.set_xlabel("Erro X (m)", fontweight="bold")
             ax3.set_ylabel("Erro Y (m)", fontweight="bold")
-            ax3.set_title("Dispersão do Erro de Estimação", fontweight="bold")
+            ax3.set_title("Dispersão dos Erros de Estimação (assinados)", fontweight="bold")
             ax3.grid(True, alpha=0.3, linestyle="--")
             fig3.savefig(f"{save_dir}/{video_name}_3_scatter.png")
-            
-            # ===== GRÁFICO 4: NIS (Normalized Innovation Squared) =====
+
+            # ===== GRÁFICO 4: NIS (CORRIGIDO) =====
             fig4 = Figure(figsize=(12, 6), tight_layout=True, dpi=150)
             ax4 = fig4.add_subplot(111)
-            frames = [i for i, n in enumerate(self.nis_vals) if not np.isnan(n)]
-            ax4.plot(frames, valid_nis, 'm-', alpha=0.7, label="NIS Calculado")
-            ax4.axhline(5.99, color='r', linestyle='--', linewidth=2, label="Limite 95% Confiança (Chi-quadrado)")
-            ax4.set_ylim(0, max(15, np.percentile(valid_nis, 95) * 1.5 if valid_nis else 15))
+            frames_nis = [i for i, n in enumerate(self.nis_vals) if not np.isnan(n)]
+            if valid_nis:
+                ax4.plot(frames_nis, valid_nis, 'm-', alpha=0.7, label="NIS Calculado")
+                ax4.axhline(5.99, color='r', linestyle='--', linewidth=2, label="Limite 95% Confiança (χ²)")
+                ax4.set_ylim(0, max(15, np.percentile(valid_nis, 95) * 1.5))
             ax4.set_xlabel("Frames", fontweight="bold")
             ax4.set_ylabel("Valor NIS", fontweight="bold")
-            ax4.set_title("Teste de Consistência NIS", fontweight="bold")
+            ax4.set_title("Teste de Consistência NIS (covariância corrigida)", fontweight="bold")
             ax4.legend()
             ax4.grid(True, alpha=0.3, linestyle="--")
             fig4.savefig(f"{save_dir}/{video_name}_4_nis.png")
-            
+
             # ===== GRÁFICO 5: HISTOGRAMA DOS ERROS =====
             fig5 = Figure(figsize=(10, 6), tight_layout=True, dpi=150)
             ax5 = fig5.add_subplot(111)
-            ax5.hist(valid_dx, bins=30, alpha=0.5, color='blue', label='Erros X (m)')
-            ax5.hist(valid_dy, bins=30, alpha=0.5, color='orange', label='Erros Y (m)')
-            ax5.set_xlabel("Magnitude do Erro (metros)", fontweight="bold")
+            ax5.hist(signed_dx, bins=30, alpha=0.5, color='blue', label='Erros X (m)')
+            ax5.hist(signed_dy, bins=30, alpha=0.5, color='orange', label='Erros Y (m)')
+            ax5.set_xlabel("Erro (metros)", fontweight="bold")
             ax5.set_ylabel("Frequência", fontweight="bold")
-            ax5.set_title("Histograma dos Erros de Estado", fontweight="bold")
+            ax5.set_title("Histograma dos Erros de Estado (assinados)", fontweight="bold")
             ax5.legend()
             ax5.grid(True, alpha=0.3, linestyle="--")
             fig5.savefig(f"{save_dir}/{video_name}_5_hist.png")
-            
-            # Fechamento de memória do matplotlib
-            plt.close(fig1); plt.close(fig2); plt.close(fig3); plt.close(fig4); plt.close(fig5)
-            
-            # ===== GERAR TXT COM RESUMO DE MÉTRICAS =====
+
+            plt.close('all')
+
+            # ========== CÁLCULO DE MÉTRICAS ==========
             rmse_x_total = np.sqrt(np.nanmean(self.sqerr_x)) if self.sqerr_x else 0.0
             rmse_y_total = np.sqrt(np.nanmean(self.sqerr_y)) if self.sqerr_y else 0.0
+            mean_signed_dx = np.mean(signed_dx) if signed_dx else 0.0
+            mean_signed_dy = np.mean(signed_dy) if signed_dy else 0.0
+            std_dx = np.std(signed_dx) if signed_dx else 0.0
+            std_dy = np.std(signed_dy) if signed_dy else 0.0
+            max_err_x = np.max(np.abs(signed_dx)) if signed_dx else 0.0
+            max_err_y = np.max(np.abs(signed_dy)) if signed_dy else 0.0
+
             mean_nis = np.mean(valid_nis) if valid_nis else 0.0
             nis_above_95 = sum(1 for n in valid_nis if n > 5.99)
             nis_pct_above = (nis_above_95 / len(valid_nis)) * 100 if valid_nis else 0.0
-            max_err_x = np.max(valid_dx) if valid_dx else 0.0
-            max_err_y = np.max(valid_dy) if valid_dy else 0.0
-            
+
+            # Tempo de convergência (frames -> segundos)
+            conv_time_x = conv_idx_x / self.fps if conv_idx_x is not None else None
+            conv_time_y = conv_idx_y / self.fps if conv_idx_y is not None else None
+
+            # ========== RELATÓRIO TXT ==========
             txt_path = f"{save_dir}/{video_name}_metrics.txt"
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write("====================================================\n")
                 f.write("      RESUMO DE MÉTRICAS - FILTRO DE KALMAN         \n")
                 f.write("====================================================\n\n")
                 f.write(f"Arquivo Fonte: {self.video_path}\n")
-                f.write(f"Data da Análise: {time.strftime('%d/%m/%Y %H:%M:%S')}\n\n")
-                
-                # --- NOVO: BLOCO DAS MATRIZES ---
-                f.write("--- PARÂMETROS DO FILTRO ---\n")
-                
-                # Formatação elegante para matrizes numpy
+                f.write(f"Data da Análise: {time.strftime('%d/%m/%Y %H:%M:%S')}\n")
+                f.write(f"Total de Frames: {self.total_frames}\n")
+                f.write(f"FPS: {self.fps:.2f}\n\n")
+
+                # Parâmetros do filtro
                 fmt_opts = {'precision': 6, 'suppress_small': True, 'separator': '  '}
-                
+                f.write("--- PARÂMETROS DO FILTRO ---\n")
                 if hasattr(self, 'saved_Q') and self.saved_Q is not None:
                     f.write("Matriz de Ruído de Processo Contínuo (Q):\n")
                     f.write(f"{np.array2string(np.array(self.saved_Q), **fmt_opts)}\n\n")
-                
                 if hasattr(self, 'saved_Qd') and self.saved_Qd is not None:
                     f.write("Matriz de Ruído de Processo Discretizada (Qd):\n")
                     f.write(f"{np.array2string(np.array(self.saved_Qd), **fmt_opts)}\n\n")
                 else:
-                    f.write("Matriz de Ruído de Processo Discretizada (Qd): [Não Disponível/Não Calculada]\n\n")
-                
+                    f.write("Matriz de Ruído de Processo Discretizada (Qd): [Não Disponível]\n\n")
                 if hasattr(self, 'saved_R') and self.saved_R is not None:
                     f.write("Matriz de Ruído de Medição (R):\n")
                     f.write(f"{np.array2string(np.array(self.saved_R), **fmt_opts)}\n\n")
-                
                 f.write("----------------------------------------------------\n\n")
 
-                f.write("--- RETENÇÃO DE DETECÇÃO ---\n")
-                f.write(f"Taxa de Detecção Estável (Na janela de incerteza): {self.detection_rate:.2f}%\n\n")
-                
-                f.write("--- ERROS ABSOLUTOS E RMS (Metros) ---\n")
-                f.write(f"RMSE X (Raiz do Erro Quadrático Médio): {rmse_x_total:.4f} m\n")
-                f.write(f"RMSE Y (Raiz do Erro Quadrático Médio): {rmse_y_total:.4f} m\n")
-                f.write(f"Erro Máximo Registrado em X: {max_err_x:.4f} m\n")
-                f.write(f"Erro Máximo Registrado em Y: {max_err_y:.4f} m\n\n")
-                
+                f.write("--- TAXAS DE DETECÇÃO E CONSISTÊNCIA ---\n")
+                f.write(f"Taxa de Detecção (frames com medição): {self.detection_rate:.2f}%\n")
+                f.write(f"Taxa de Inliers (medições dentro da janela 3σ): {self.inlier_rate:.2f}%\n\n")
+
+                f.write("--- ERROS DE ESTIMAÇÃO (METROS) ---\n")
+                f.write(f"RMSE X: {rmse_x_total:.4f} m\n")
+                f.write(f"RMSE Y: {rmse_y_total:.4f} m\n")
+                f.write(f"Erro Médio (viés) em X: {mean_signed_dx:+.4f} m\n")
+                f.write(f"Erro Médio (viés) em Y: {mean_signed_dy:+.4f} m\n")
+                f.write(f"Desvio Padrão Erro X: {std_dx:.4f} m\n")
+                f.write(f"Desvio Padrão Erro Y: {std_dy:.4f} m\n")
+                f.write(f"Erro Máximo Absoluto X: {max_err_x:.4f} m\n")
+                f.write(f"Erro Máximo Absoluto Y: {max_err_y:.4f} m\n\n")
+
+                f.write("--- CONVERGÊNCIA DO RMS ---\n")
+                if conv_time_x is not None:
+                    f.write(f"RMS X convergiu em {conv_idx_x} frames ({conv_time_x:.2f} s)\n")
+                else:
+                    f.write("RMS X não atingiu convergência dentro do vídeo.\n")
+                if conv_time_y is not None:
+                    f.write(f"RMS Y convergiu em {conv_idx_y} frames ({conv_time_y:.2f} s)\n")
+                else:
+                    f.write("RMS Y não atingiu convergência dentro do vídeo.\n")
+                f.write("(Critério: erro RMS ≤ 5% do valor final por 10 frames consecutivos)\n\n")
+
                 f.write("--- AVALIAÇÃO DE CONSISTÊNCIA (NIS) ---\n")
-                f.write(f"NIS Médio (Ideal próximo aos graus de liberdade, ex: 2): {mean_nis:.4f}\n")
-                f.write(f"Leituras que excederam limite 95% (5.99): {nis_pct_above:.2f}%\n")
+                f.write(f"NIS Médio (ideal ≈ 2): {mean_nis:.4f}\n")
+                f.write(f"Percentual acima do limite 95% (5.99): {nis_pct_above:.2f}%\n")
                 f.write(" * Nota: O NIS avalia se a covariância reflete a real incerteza do modelo.\n")
                 f.write("   Uma porcentagem acima de ~5% no limite indica que o filtro está subestimando\n")
                 f.write("   o ruído ou divergindo levemente.\n\n")
                 f.write("====================================================\n")
 
-            # ===== EXPORTAÇÃO PARA CSV =====
-            csv_path = f"{save_dir}/{video_name}_positions_{timestamp}.csv"
+            # ========== CSV ==========
+            csv_path = f"{save_dir}/{video_name}_positions.csv"
             with open(csv_path, mode='w', newline='', encoding='utf-8') as f_csv:
                 writer = csv.writer(f_csv, delimiter=',')
-                # Cabeçalhos do CSV
                 writer.writerow(["Frame", "Meas_X(m)", "Meas_Y(m)", "Filt_X(m)", "Filt_Y(m)"])
-                
-                # Zip garante a sincronia entre a lista de medições e a de filtro por frame
                 for frame_idx, (m_pt, f_pt) in enumerate(zip(self.meas_pts, self.filt_pts)):
-                    # Formata para 4 casas decimais ou deixa vazio caso não haja medição (None)
                     mx = f"{m_pt[0]:.4f}" if m_pt is not None else ""
                     my = f"{m_pt[1]:.4f}" if m_pt is not None else ""
-                    
                     fx = f"{f_pt[0]:.4f}" if f_pt is not None else ""
                     fy = f"{f_pt[1]:.4f}" if f_pt is not None else ""
-                    
                     writer.writerow([frame_idx, mx, my, fx, fy])
-            
+
             messagebox.showinfo("Sucesso", f"Análise completa e arquivo .csv salvos em:\n{save_dir}/")
-            
+
         except Exception as e:
             error_msg = traceback.format_exc()
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao gerar relatórios: {error_msg}"))
-        
         finally:
             self.processing = False
-            
+
     def _on_processing_complete(self):
         """Seletor de interface chamado ao finalizar o processamento."""
         self.status_lbl.config(text=f"Status: Concluído | Detecção: {self.detection_rate:.1f}%")
