@@ -12,9 +12,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import csv 
 
 # Importando as classes corrigidas diretamente do seu arquivo world.py
-from src.models.world import World, Entidy
+from src.models.world import World, Entidy, Robot
 from src.gui.viewers import VideoViewer
 from src.detec.detector import detect_centroid
+from src.detec.detectBot import detect_bot
 
 import traceback
 
@@ -37,10 +38,14 @@ class KalmanApp:
         self.root.minsize(1400, 750)
         
         # Dimensões reais desejadas
-        self.max_x = 150 #metros
-        self.max_y = 150 #metros
+        self.max_x = 100 #metrosf
+        self.max_y = 75 #metros
 
-        self.min_window_m = 2.5 #metros
+        # Localização das torres no mapa
+        self.towers = None 
+
+        #Tamanho mínimo do ROI 
+        self.min_window_m = int(self.max_x/40) #metros
 
         # Maximize window
         try:
@@ -74,15 +79,24 @@ class KalmanApp:
         self.kalman_windows = []  # Armazena as matrizes P de covariância
         self.pred_pts = []          # posição predita (antes do update)
         self.innovations = []       # diferença z - H*x_pred (2D)
-        self.nis_values = []        # inovação normalizada escalar
+        self.nis_vals = []          # Corrigido para uniformidade com o processamento
         self.prior_covs = []        # covariância predita P_pred
         self.measurements_raw = []  # medições em metros (para gráficos de dispersão)
 
+        self.load_interface()
+
+    def load_interface(self):
         # Visualization toggle states
         self.show_traj = tk.BooleanVar(value=True)
         self.show_detect = tk.BooleanVar(value=True)
         self.show_kalman = tk.BooleanVar(value=True)
-        self.show_window = tk.BooleanVar(value=False)
+        self.show_window = tk.BooleanVar(value=True)
+
+        # Thread-safe boolean cache para o processador de vídeo
+        self.show_traj_val = True
+        self.show_detect_val = True
+        self.show_kalman_val = True
+        self.show_window_val = True
 
         # Main layout: left (300) | center (750) | right (450) = proportion 2:5:3
         self.root.grid_columnconfigure(0, weight=0, minsize=300)  
@@ -90,107 +104,151 @@ class KalmanApp:
         self.root.grid_columnconfigure(2, weight=0, minsize=450)  
         self.root.grid_rowconfigure(0, weight=1)
 
-        # --- LEFT PANEL: 4 Sections ---
+        # build painel
+        self._build_left_painel()
+        self._build_center_painer()
+        self._build_right_painel()
+
+        # Playback poll
+        self.root.after(33, self._poll_playback)
+
+    def _build_left_painel(self):
+        ### --- LEFT PANEL: 7 Sections (Com Métricas e Torres) ---
         self.left_frame = tk.Frame(self.root, bg="white", width=300)
         self.left_frame.grid(row=0, column=0, sticky="nsew")
         self.left_frame.grid_propagate(False)
 
-        # Title
+        # Título Super Compacto
         title_lbl = tk.Label(self.left_frame, text="Filtro de Kalman", 
-                            font=("Segoe UI", 14, "bold"), bg="white", fg="#333333")
-        title_lbl.pack(fill="x", padx=10, pady=(12, 6))
+                            font=("Segoe UI", 11, "bold"), bg="white", fg="#333333")
+        title_lbl.pack(fill="x", padx=10, pady=(4, 2))
         
-        # Separator
+        # Separador Fino
         sep1 = tk.Frame(self.left_frame, bg="#e0e0e0", height=1)
-        sep1.pack(fill="x", padx=10, pady=4)
+        sep1.pack(fill="x", padx=10, pady=2)
 
         # ===== SECTION 1: Carregar o vídeo =====
         entrada_lbl_frame = tk.LabelFrame(self.left_frame, text="📄 Carregar o vídeo", 
-                                         font=("Segoe UI", 10, "bold"), 
-                                         bg="#f5f5f5", fg="#333333", padx=10, pady=10)
-        entrada_lbl_frame.pack(fill="x", padx=8, pady=(4, 4))
+                                        font=("Segoe UI", 9, "bold"), 
+                                        bg="#f5f5f5", fg="#333333", padx=8, pady=2)
+        entrada_lbl_frame.pack(fill="x", padx=8, pady=1)
 
-        ttk.Label(entrada_lbl_frame, text="Vídeo carregado:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        self.video_path_label = tk.Label(entrada_lbl_frame, text="Nenhum vídeo", 
-                                         wraplength=260, font=("Segoe UI", 8), 
-                                         fg="#666666", bg="#f5f5f5")
-        self.video_path_label.pack(anchor="w", pady=(4, 8))
+        self.video_path_label = tk.Label(entrada_lbl_frame, text="Nenhum vídeo (Ou Arena Sintética)", 
+                                        wraplength=260, font=("Segoe UI", 8), 
+                                        fg="#666666", bg="#f5f5f5")
+        self.video_path_label.pack(anchor="w", pady=(1, 2))
 
-        self.load_btn = tk.Button(entrada_lbl_frame, text="📁 Load", command=self.load_video, 
-                                 font=("Segoe UI", 9, "bold"), bg="#4a4a4a", fg="white", 
-                                 relief="flat", padx=10, pady=1, cursor="hand2")
-        self.load_btn.pack(fill="x", pady=4)
+        self.load_btn = tk.Button(entrada_lbl_frame, text="📁 Load Vídeo", command=self.load_video, 
+                                font=("Segoe UI", 8, "bold"), bg="#4a4a4a", fg="white", 
+                                relief="flat", padx=10, pady=1, cursor="hand2")
+        self.load_btn.pack(fill="x", pady=1)
 
-        # ===== SECTION 2: Opções do Filtro (Modelo 6D Fixo) =====
+        # ===== SECTION 1.5: Modo da Simulação =====
+        modo_lbl_frame = tk.LabelFrame(self.left_frame, text="🎮 Modo da Simulação", 
+                                        font=("Segoe UI", 9, "bold"), 
+                                        bg="#f5f5f5", fg="#333333", padx=8, pady=2)
+        modo_lbl_frame.pack(fill="x", padx=8, pady=1)
+
+        if not hasattr(self, 'sim_mode'):
+            self.sim_mode = tk.StringVar(value="visao_computacional")
+
+        rb_visao = ttk.Radiobutton(modo_lbl_frame, text="Visão Computacional", 
+                                   variable=self.sim_mode, value="visao_computacional",
+                                   command=self._on_mode_change)
+        rb_visao.pack(anchor="w", pady=1)
+
+        rb_robotica = ttk.Radiobutton(modo_lbl_frame, text="Localização Robótica (EKF)", 
+                                     variable=self.sim_mode, value="localizacao_robotica",
+                                     command=self._on_mode_change) 
+        rb_robotica.pack(anchor="w", pady=1)
+
+        # Chamar uma vez para garantir que inicia no estado correto (travar ou destravar LOAD)
+        self.root.after(100, self._on_mode_change)
+
+        # ===== NOVA SEÇÃO: Localização das Torres =====
+        torres_lbl_frame = tk.LabelFrame(self.left_frame, text="🗼 Localização das Torres (m)", 
+                                        font=("Segoe UI", 9, "bold"), 
+                                        bg="#f5f5f5", fg="#333333", padx=6, pady=2)
+        torres_lbl_frame.pack(fill="x", padx=8, pady=1)
+
+        grid_torres = tk.Frame(torres_lbl_frame, bg="#f5f5f5")
+        grid_torres.pack(fill="x", pady=1)
+
+        default_towers = [("0.0", "0.0"), ("10.0", "0.0"), ("0.0", "10.0"), ("10.0", "10.0")]
+        self.tower_entries = []
+
+        for i in range(4):
+            row = i // 2
+            col = (i % 2) * 3
+            
+            lbl = tk.Label(grid_torres, text=f"T{i+1}:", font=("Segoe UI", 8, "bold"), bg="#f5f5f5", fg="#4b5563")
+            lbl.grid(row=row, column=col, sticky="w", padx=(2, 1), pady=1)
+            
+            ent_x = ttk.Entry(grid_torres, width=5, font=("Segoe UI", 8))
+            ent_x.insert(0, default_towers[i][0])
+            ent_x.grid(row=row, column=col+1, padx=1, pady=1)
+            
+            ent_y = ttk.Entry(grid_torres, width=5, font=("Segoe UI", 8))
+            ent_y.insert(0, default_towers[i][1])
+            ent_y.grid(row=row, column=col+2, padx=(1, 4), pady=1)
+            
+            self.tower_entries.append((ent_x, ent_y))
+
+        # ===== SECTION 2: Opções do Filtro =====
         config_lbl_frame = tk.LabelFrame(self.left_frame, text="⚙ Opções do Filtro & Sensor", 
-                                        font=("Segoe UI", 10, "bold"), 
-                                        bg="#f5f5f5", fg="#333333", padx=10, pady=10)
-        config_lbl_frame.pack(fill="x", padx=8, pady=(4, 4))
+                                        font=("Segoe UI", 9, "bold"), 
+                                        bg="#f5f5f5", fg="#333333", padx=8, pady=2)
+        config_lbl_frame.pack(fill="x", padx=8, pady=1)
 
-        # Fixed model label
-        ttk.Label(config_lbl_frame, text="Modelo: Entidy 6D [x, y, vx, vy, ax, ay]", 
-                 font=("Segoe UI", 8, "bold"), foreground="#0066cc").pack(anchor="w", pady=(0, 6))
+        self.detector_noise_entry = ttk.Entry(config_lbl_frame, width=10)
+        self.detector_noise_entry.insert(0, "0.16")
 
-        #Erro do detector de centroide (Simulação de ruído do sensor)
-        ttk.Label(config_lbl_frame, text="Erro do Detector (Ruído em Pixels):", 
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 2))
-        self.detector_noise_entry = ttk.Entry(config_lbl_frame, width=12)
-        self.detector_noise_entry.insert(0, "1.0")  # Valor padrão de ruído de pixel
-        self.detector_noise_entry.pack(anchor="w", pady=(0, 8))
+        lbl_noise = ttk.Label(config_lbl_frame, text="Ruído do Sensor (Metros):", font=("Segoe UI", 8))
+        lbl_noise.pack(anchor="w", pady=(1, 0))
+        self.detector_noise_entry.pack(anchor="w", pady=(0, 2))
 
-        # Q matrix diagonal inputs (6 values)
-        ttk.Label(config_lbl_frame, text="Q - Diagonal (Ruído de Processo):", 
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 4))
+        ttk.Label(config_lbl_frame, text="Q - Diagonal (Processo):", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=1)
         
         q_frame = tk.Frame(config_lbl_frame, bg="#f5f5f5")
-        q_frame.pack(fill="x", pady=(0, 6))
+        q_frame.pack(fill="x", pady=(0, 1))
         
-        q_labels = ["Q[0,0] (x)", "Q[1,1] (y)", "Q[2,2] (vx)", "Q[3,3] (vy)", "Q[4,4] (ax)", "Q[5,5] (ay)"]
-        
-        # Valores padrão baseados na cinemática: Pos(1e-4), Vel(1e-2), Acel(1.0)
+        q_labels = ["Q[0,0]", "Q[1,1]", "Q[2,2]", "Q[3,3]", "Q[4,4]", "Q[5,5]"]
         default_q_vals = ["5e-1", "5e-1", "5e-1", "5e-1", "5e-1", "5e-1"]
         
         self.q_entries = []
         for i, label in enumerate(q_labels):
-            col = i % 3
-            row = i // 3
+            c = i % 3
+            r = i // 3
             lbl = tk.Label(q_frame, text=label, font=("Segoe UI", 7), bg="#f5f5f5")
-            lbl.grid(row=row*2, column=col, sticky="w", padx=2, pady=(2, 0))
+            lbl.grid(row=r*2, column=c, sticky="w", padx=1, pady=0)
             
             entry = ttk.Entry(q_frame, width=8)
-            # Insere o valor padrão correspondente ao índice atual
             entry.insert(0, default_q_vals[i])
-            entry.grid(row=row*2+1, column=col, sticky="ew", padx=2, pady=(0, 4))
-            
+            entry.grid(row=r*2+1, column=c, sticky="ew", padx=1, pady=(0, 1))
             self.q_entries.append(entry)
             
         q_frame.columnconfigure(0, weight=1)
         q_frame.columnconfigure(1, weight=1)
         q_frame.columnconfigure(2, weight=1)
 
-        # R matrix diagonal inputs (2 values)
-        ttk.Label(config_lbl_frame, text="R - Diagonal (Ruído de Medição):", 
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 4))
+        ttk.Label(config_lbl_frame, text="R - Diagonal (Medição):", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=1)
         
         r_frame = tk.Frame(config_lbl_frame, bg="#f5f5f5")
-        r_frame.pack(fill="x", pady=(0, 2))
+        r_frame.pack(fill="x", pady=(0, 1))
         
-        r_labels = ["R[0,0] (x)", "R[1,1] (y)"]
-        
-        # Valores padrão baseados na variância do erro em metros: 0.1m^2 = 0.01 = 1e-2
+        r_labels = ["R[0,0]", "R[1,1]"]
         default_r_vals = ["1e-2", "1e-2"]
         
         self.r_entries = []
         for i, label in enumerate(r_labels):
-            col = i % 2 
-            row = i // 2
+            c = i % 2 
+            r = i // 2
             lbl = tk.Label(r_frame, text=label, font=("Segoe UI", 7), bg="#f5f5f5")
-            lbl.grid(row=row*2, column=col, sticky="w", padx=2, pady=(2, 0))
+            lbl.grid(row=r*2, column=c, sticky="w", padx=1, pady=0)
             
             entry = ttk.Entry(r_frame, width=8)
             entry.insert(0, default_r_vals[i])
-            entry.grid(row=row*2+1, column=col, sticky="ew", padx=2, pady=(0, 4))
-            
+            entry.grid(row=r*2+1, column=c, sticky="ew", padx=1, pady=(0, 1))
             self.r_entries.append(entry)
             
         r_frame.columnconfigure(0, weight=1)
@@ -198,187 +256,249 @@ class KalmanApp:
 
         # ===== SECTION 3: Opções de Debug =====
         debug_lbl_frame = tk.LabelFrame(self.left_frame, text="🔍 Opções de Debug", 
-                                       font=("Segoe UI", 10, "bold"), 
-                                       bg="#f5f5f5", fg="#333333", padx=10, pady=10)
-        debug_lbl_frame.pack(fill="x", padx=8, pady=(4, 4))
+                                        font=("Segoe UI", 9, "bold"), 
+                                        bg="#f5f5f5", fg="#333333", padx=8, pady=2)
+        debug_lbl_frame.pack(fill="x", padx=8, pady=1)
 
-        ttk.Checkbutton(debug_lbl_frame, text="Desenhar trajetória", variable=self.show_traj).pack(anchor="w", pady=2)
-        ttk.Checkbutton(debug_lbl_frame, text="Desenhar detecção", variable=self.show_detect).pack(anchor="w", pady=2)
-        ttk.Checkbutton(debug_lbl_frame, text="Desenhar Kalman", variable=self.show_kalman).pack(anchor="w", pady=2)
-        ttk.Checkbutton(debug_lbl_frame, text="Desenhar Janela Kalman", variable=self.show_window).pack(anchor="w", pady=2)
+        ttk.Checkbutton(debug_lbl_frame, text="Desenhar trajetória", variable=self.show_traj).pack(anchor="w")
+        ttk.Checkbutton(debug_lbl_frame, text="Desenhar detecção", variable=self.show_detect).pack(anchor="w")
+        ttk.Checkbutton(debug_lbl_frame, text="Desenhar Kalman", variable=self.show_kalman).pack(anchor="w")
+        ttk.Checkbutton(debug_lbl_frame, text="Desenhar Janela Kalman", variable=self.show_window).pack(anchor="w")
 
-        # ===== SECTION 4: EXEC Button =====
-        exec_lbl_frame = tk.Frame(self.left_frame, bg="#f5f5f5", padx=10, pady=10)
+        # ===== SECTION 4: Status e Métricas =====
+        info_lbl_frame = tk.LabelFrame(self.left_frame, text="📊 Status e Métricas", 
+                                        font=("Segoe UI", 9, "bold"), 
+                                        bg="#f5f5f5", fg="#333333", padx=8, pady=4)
+        info_lbl_frame.pack(fill="x", padx=8, pady=2)
+
+        # Status geral com destaque em negrito
+        self.status_lbl = tk.Label(info_lbl_frame, text="Status: Aguardando Ação", 
+                                font=("Segoe UI", 8, "bold"), fg="#16a34a", bg="#f5f5f5")
+        self.status_lbl.pack(anchor="w", pady=(0, 2))
+
+        # Labels de Inliers e Detecção preparadas para serem atualizadas
+        self.det_rate_lbl = tk.Label(info_lbl_frame, text="Taxa de Detecção: --%", 
+                                    font=("Segoe UI", 8), fg="#4b5563", bg="#f5f5f5")
+        self.det_rate_lbl.pack(anchor="w", pady=1)
+
+        self.inlier_rate_lbl = tk.Label(info_lbl_frame, text="Inliers (na Janela): --%", 
+                                        font=("Segoe UI", 8), fg="#4b5563", bg="#f5f5f5")
+        self.inlier_rate_lbl.pack(anchor="w", pady=1)
+
+        # ===== SECTION 5: EXEC & SAVE Buttons =====
+        exec_lbl_frame = tk.Frame(self.left_frame, bg="white")
         exec_lbl_frame.pack(fill="x", padx=8, pady=(4, 8))
 
-        self.exec_btn = tk.Button(exec_lbl_frame, text="▶ EXEC", command=self.execute_processing, 
-                                 font=("Segoe UI", 11, "bold"), bg="#333333", fg="white", 
-                                 relief="flat", padx=20, pady=1, cursor="hand2", state="disabled")
-        self.exec_btn.pack(fill="x")
+        btn_frame = tk.Frame(exec_lbl_frame, bg="white")
+        btn_frame.pack(fill="x")
 
-        # Status label
-        self.status_lbl = tk.Label(exec_lbl_frame, text="Status: Aguardando", 
-                                  font=("Segoe UI", 8), fg="#666666", bg="#f5f5f5")
-        self.status_lbl.pack(pady=(6, 4))
+        # pady=8 nos botões para garantir uma excelente área de clique
+        self.exec_btn = tk.Button(btn_frame, text="▶ EXEC", command=self.execute_processing, 
+                                font=("Segoe UI", 9, "bold"), bg="#333333", fg="white", 
+                                relief="flat", padx=10, pady=8, cursor="hand2", state="disabled")
+        self.exec_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
 
-        # SAVE RESULTS Button
-        self.save_btn = tk.Button(exec_lbl_frame, text="💾 Salvar Resultados", command=self.save_results, 
-                                 font=("Segoe UI", 10, "bold"), bg="#666666", fg="white", 
-                                 relief="flat", padx=15, pady=6, cursor="hand2", state="disabled")
-        self.save_btn.pack(fill="x", pady=(4, 0))
+        self.save_btn = tk.Button(btn_frame, text="💾 Salvar", command=self.save_results, 
+                                font=("Segoe UI", 9, "bold"), bg="#666666", fg="white", 
+                                relief="flat", padx=10, pady=8, cursor="hand2", state="disabled")
+        self.save_btn.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
+    def _on_mode_change(self):
+        """Avalia o tipo de simulação e trava/destrava os botões apropriados."""
+        modo = self.sim_mode.get()
+        if modo == "visao_computacional":
+            self.load_btn.config(state="normal")
+            # Se não houver vídeo carregado, trava o botão de executar
+            if not getattr(self, 'video_path', None):
+                self.exec_btn.config(state="disabled")
+            else:
+                self.exec_btn.config(state="normal")
+        else:
+            # Modo Robótica NÃO precisa de vídeo, ele mesmo gera a arena em fundo escuro
+            self.load_btn.config(state="disabled")
+            self.exec_btn.config(state="normal")
+
+    def _build_center_painer(self):
         # --- CENTER PANEL: Single Viewer ---
-        self.center_frame = tk.Frame(self.root, bg="#f9f9f9")
-        self.center_frame.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
+        self.center_frame = tk.Frame(self.root, bg="#f3f4f6")
+        self.center_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
 
+        # 1. TÍTULO
         viewer_title = tk.Label(self.center_frame, text="🎬 Rastreamento com Filtro de Kalman", 
-                               font=("Segoe UI", 11, "bold"), bg="#f9f9f9", fg="#333333")
-        viewer_title.pack(fill="x", padx=0, pady=(0, 10))
+                            font=("Segoe UI", 14, "bold"), bg="#f3f4f6", fg="#1f2937")
+        viewer_title.pack(fill="x", pady=(0, 10))
         
-        # INFO BANNER: Video details
-        info_frame = tk.Frame(self.center_frame, bg="#e8e8e8", height=60)
-        info_frame.pack(fill="x", pady=(0, 8), padx=0)
-        info_frame.pack_propagate(False)
-        
-        self.video_info_lbl = tk.Label(info_frame, 
-                                       text="Arquivo: — | Tamanho: — | FPS: — | Frames: — | Taxa: —",
-                                       font=("Segoe UI", 8), fg="#555555", bg="#e8e8e8", 
-                                       justify="left", wraplength=700)
-        self.video_info_lbl.pack(anchor="w", padx=10, pady=8)
-        
-        # VIEWER CONTAINER
-        viewer_container = tk.Frame(self.center_frame, bg="#f9f9f9")
-        viewer_container.pack(fill="both", expand=True, pady=(0, 8))
+        # 2. VIEWER CONTAINER
+        viewer_container = tk.Frame(self.center_frame, bg="#000000", bd=0, highlightthickness=1, highlightbackground="#d1d5db")
+        viewer_container.pack(fill="both", expand=True, pady=(0, 15))
         
         self.tela_viewer = VideoViewer(viewer_container, width=self.video_width, 
-                                       height=self.video_height, bg="white")
-        self.tela_viewer.pack()
+                                    height=self.video_height, bg="black")
+        self.tela_viewer.pack(expand=True)
 
-        # TIME DISPLAY (centered)
-        self.time_info_lbl = tk.Label(self.center_frame, text="00:00 / 00:00", 
-                                      font=("Segoe UI", 9, "bold"), fg="#333333", bg="#f9f9f9")
-        self.time_info_lbl.pack(pady=(0, 6))
-
-        # PLAYBACK CONTROLS (below viewer)
-        controls_frame = tk.Frame(self.center_frame, bg="#f9f9f9")
-        controls_frame.pack(fill="x", pady=(0, 8))
+        # 3. PLAYBACK CONTROLS
+        controls_frame = tk.Frame(self.center_frame, bg="#f3f4f6")
+        controls_frame.pack(fill="x", pady=(0, 15))
         
-        controls_inner = tk.Frame(controls_frame, bg="#f9f9f9")
+        controls_inner = tk.Frame(controls_frame, bg="#f3f4f6")
         controls_inner.pack(anchor="center")
         
-        self.prev_btn = tk.Button(controls_inner, text="◄ Anterior", command=self.prev_frame, 
-                                 font=("Segoe UI", 9, "bold"), bg="#4a4a4a", fg="white", 
-                                 relief="flat", padx=12, pady=6, state="disabled", cursor="hand2",
-                                 activebackground="#666666")
-        self.prev_btn.pack(side="left", padx=6)
+        btn_opts = {
+            "font": ("Segoe UI", 10, "bold"), "bg": "#374151", "fg": "white", 
+            "relief": "flat", "padx": 16, "pady": 6, "cursor": "hand2",
+            "activebackground": "#4b5563", "borderwidth": 0
+        }
         
-        self.play_btn = tk.Button(controls_inner, text="⏵ Play", command=self.toggle_playback, 
-                                 font=("Segoe UI", 9, "bold"), bg="#4a4a4a", fg="white", 
-                                 relief="flat", padx=12, pady=6, state="disabled", cursor="hand2",
-                                 activebackground="#666666")
-        self.play_btn.pack(side="left", padx=6)
+        self.prev_btn = tk.Button(controls_inner, text="◄ Anterior", command=self.prev_frame, state="disabled", **btn_opts)
+        self.prev_btn.grid(row=0, column=0, padx=8)
         
-        self.next_btn = tk.Button(controls_inner, text="Próximo ►", command=self.next_frame, 
-                                 font=("Segoe UI", 9, "bold"), bg="#4a4a4a", fg="white", 
-                                 relief="flat", padx=12, pady=6, state="disabled", cursor="hand2",
-                                 activebackground="#666666")
-        self.next_btn.pack(side="left", padx=6)
+        self.play_btn = tk.Button(controls_inner, text="⏵ Play", command=self.toggle_playback, state="disabled", **btn_opts)
+        self.play_btn.grid(row=0, column=1, padx=8)
+        
+        self.next_btn = tk.Button(controls_inner, text="Próximo ►", command=self.next_frame, state="disabled", **btn_opts)
+        self.next_btn.grid(row=0, column=2, padx=8)
 
-        # DEBUG LEGEND
-        legend_frame = tk.Frame(self.center_frame, bg="#f5f5f5", relief="solid", borderwidth=1)
-        legend_frame.pack(fill="x", pady=(0, 0), padx=0)
-        
-        legend_title = tk.Label(legend_frame, text="📋 Legenda de Debug", 
-                               font=("Segoe UI", 9, "bold"), bg="#f5f5f5", fg="#333333")
-        legend_title.pack(anchor="w", padx=10, pady=(6, 4))
-        
-        legend_text = tk.Label(legend_frame, 
-                              text="🔴 Detecção (vermelho) = centroide medido pelo detector\n"
-                                   "🟦 Kalman (azul) = posição estimada pelo filtro\n"
-                                   "🟩 Trajetória (verde) = caminho filtrado\n"
-                                   "🟦 Janela Kalman (cyan) = região de incerteza dinâmica (±3σ mapeada de metros para pixels)",
-                              font=("Segoe UI", 8), fg="#666666", bg="#f5f5f5", 
-                              justify="left")
-        legend_text.pack(anchor="w", padx=10, pady=(0, 6))
+        self.time_info_lbl = tk.Label(controls_inner, text="00:00 / 00:00", 
+                                    font=("Segoe UI", 11, "bold"), fg="#374151", bg="#f3f4f6")
+        self.time_info_lbl.grid(row=0, column=3, padx=(20, 0))
 
+        # 4. DASHBOARD DE INFORMAÇÕES
+        info_dashboard = tk.Frame(self.center_frame, bg="#ffffff", bd=1, relief="solid", highlightthickness=0)
+        info_dashboard.config(highlightbackground="#d1d5db", highlightcolor="#d1d5db")
+        info_dashboard.pack(fill="x", pady=(0, 0))
+        
+        # 4.1 Banner Principal do Vídeo
+        self.video_info_lbl = tk.Label(info_dashboard, 
+                                    text="Arquivo: —  |  Tamanho: —  |  FPS: —  |  Frames: —  |  Taxa: —",
+                                    font=("Segoe UI", 9, "bold"), fg="#374151", bg="#ffffff")
+        self.video_info_lbl.pack(fill="x", pady=(12, 6))
+        
+        tk.Frame(info_dashboard, bg="#e5e7eb", height=1).pack(fill="x", padx=30, pady=4)
+        
+        # 4.2 Container da Legenda
+        legend_container = tk.Frame(info_dashboard, bg="#ffffff")
+        legend_container.pack(fill="x", pady=(6, 12))
+        
+        # Escala: quantos pixels representam 1 metro (px/m)
+        px_m_x = self.video_width / self.max_x if hasattr(self, 'max_x') and self.max_x > 0 else 1.0
+        px_m_y = self.video_height / self.max_y if hasattr(self, 'max_y') and self.max_y > 0 else 1.0
+        avg_scale_px_m = (px_m_x + px_m_y) / 2.0
+        
+        # Obtém o ruído configurado em METROS
+        try:
+            erro_metros = float(self.detector_noise_entry.get().strip())
+        except Exception:
+            erro_metros = 1.0
+        
+        # Converte o erro de metros para pixels
+        erro_px = erro_metros * avg_scale_px_m
+        
+        # Linha 1: Identificação Visual (Cores)
+        l1_frame = tk.Frame(legend_container, bg="#ffffff")
+        l1_frame.pack(anchor="center", pady=2)
+        tk.Label(l1_frame, text="🔴 Detecção: Medido", font=("Segoe UI", 9, "bold"), bg="#ffffff", fg="#dc2626").pack(side="left", padx=15)
+        tk.Label(l1_frame, text="🟦 Kalman: Estimado", font=("Segoe UI", 9, "bold"), bg="#ffffff", fg="#2563eb").pack(side="left", padx=15)
+        tk.Label(l1_frame, text="🟩 Trajetória: Filtrado", font=("Segoe UI", 9, "bold"), bg="#ffffff", fg="#16a34a").pack(side="left", padx=15)
+        tk.Label(l1_frame, text="🔷 Janela: Incerteza (±3σ)", font=("Segoe UI", 9, "bold"), bg="#ffffff", fg="#9333ea").pack(side="left", padx=15)
 
-        # --- RIGHT PANEL: Metrics (Modificados para Metros) ---
+        # Linha 2: Métricas de Escala e Debug
+        l2_frame = tk.Frame(legend_container, bg="#ffffff")
+        l2_frame.pack(anchor="center", pady=2)
+        tk.Label(l2_frame, text=f"📐 Dimensões: {self.max_x}x{self.max_y} m", font=("Segoe UI", 9), bg="#ffffff", fg="#6b7280").pack(side="left", padx=15)
+        tk.Label(l2_frame, text=f"🔲 ROI Mín: {self.min_window_m:.2f} m", font=("Segoe UI", 9), bg="#ffffff", fg="#6b7280").pack(side="left", padx=15)
+        tk.Label(l2_frame, text=f"🔎 Escala Média: {avg_scale_px_m:.2f} px/m", font=("Segoe UI", 9), bg="#ffffff", fg="#6b7280").pack(side="left", padx=15)
+        
+        # Exibe o erro em metros (entrada) e a conversão para pixels
+        self.erro_sensor_lbl = tk.Label(l2_frame, text=f"⚡ Erro Simulado: {erro_metros:.4f} m ≈ {erro_px:.2f} px", 
+                                        font=("Segoe UI", 9), bg="#ffffff", fg="#6b7280")
+        self.erro_sensor_lbl.pack(side="left", padx=15)
+        
+    def _build_right_painel(self):
+        # --- RIGHT PANEL: Metrics ---
         self.right_frame = tk.Frame(self.root, bg="white")
         self.right_frame.grid(row=0, column=2, sticky="nsew", padx=6, pady=6)
 
+        # Container para colocar RMS X e RMS Y lado a lado
+        rms_container = tk.Frame(self.right_frame, bg="white")
+        rms_container.pack(fill="x", pady=(0, 4))
+        rms_container.columnconfigure(0, weight=1)
+        rms_container.columnconfigure(1, weight=1)
+
         # RMS X
-        rms_x_frame = tk.LabelFrame(self.right_frame, text="RMS de X (metros)", 
-                                   font=("Segoe UI", 10, "bold"), bg="white", fg="#333333",
-                                   padx=4, pady=4, borderwidth=1, relief="solid")
-        rms_x_frame.pack(fill="x", pady=(0, 4), expand=False)
+        rms_x_frame = tk.LabelFrame(rms_container, text="RMS X (m)", 
+                                   font=("Segoe UI", 9, "bold"), bg="white", fg="#333333",
+                                   padx=2, pady=2, borderwidth=1, relief="solid")
+        rms_x_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
         rms_x_frame.pack_propagate(False)
         rms_x_frame.configure(height=140)
         
-        self.rmsx_fig = Figure(figsize=(4.2, 1.0), tight_layout=True, facecolor="white")
+        self.rmsx_fig = Figure(figsize=(2.0, 1.0), tight_layout=True, facecolor="white")
         self.rmsx_ax = self.rmsx_fig.add_subplot(111)
-        self.rmsx_ax.set_facecolor("#f5f5f5")
-        self.rmsx_ax.tick_params(colors="#666666", labelsize=8)
-        self.rmsx_ax.spines["bottom"].set_color("#999999")
-        self.rmsx_ax.spines["left"].set_color("#999999")
-        self.rmsx_ax.spines["top"].set_visible(False)
-        self.rmsx_ax.spines["right"].set_visible(False)
+        self._style_ax(self.rmsx_ax)
         self.rmsx_line, = self.rmsx_ax.plot([], [], "#333333", linewidth=2)
         self.rmsx_canvas = FigureCanvasTkAgg(self.rmsx_fig, master=rms_x_frame)
         self.rmsx_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         # RMS Y
-        rms_y_frame = tk.LabelFrame(self.right_frame, text="RMS de Y (metros)", 
-                                   font=("Segoe UI", 10, "bold"), bg="white", fg="#333333",
-                                   padx=4, pady=4, borderwidth=1, relief="solid")
-        rms_y_frame.pack(fill="x", pady=(0, 4), expand=False)
+        rms_y_frame = tk.LabelFrame(rms_container, text="RMS Y (m)", 
+                                   font=("Segoe UI", 9, "bold"), bg="white", fg="#333333",
+                                   padx=2, pady=2, borderwidth=1, relief="solid")
+        rms_y_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
         rms_y_frame.pack_propagate(False)
         rms_y_frame.configure(height=140)
         
-        self.rmsy_fig = Figure(figsize=(4.2, 1.0), tight_layout=True, facecolor="white")
+        self.rmsy_fig = Figure(figsize=(2.0, 1.0), tight_layout=True, facecolor="white")
         self.rmsy_ax = self.rmsy_fig.add_subplot(111)
-        self.rmsy_ax.set_facecolor("#f5f5f5")
-        self.rmsy_ax.tick_params(colors="#666666", labelsize=8)
-        self.rmsy_ax.spines["bottom"].set_color("#999999")
-        self.rmsy_ax.spines["left"].set_color("#999999")
-        self.rmsy_ax.spines["top"].set_visible(False)
-        self.rmsy_ax.spines["right"].set_visible(False)
+        self._style_ax(self.rmsy_ax)
         self.rmsy_line, = self.rmsy_ax.plot([], [], "#333333", linewidth=2)
         self.rmsy_canvas = FigureCanvasTkAgg(self.rmsy_fig, master=rms_y_frame)
         self.rmsy_canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Trajetória
-        traj_frame = tk.LabelFrame(self.right_frame, text="Gráfico da Trajetória (Mundo Real - Metros)", 
+        # Histograma Frame
+        hist_frame = tk.LabelFrame(self.right_frame, text="Histograma dos Erros de Estado", 
                                   font=("Segoe UI", 10, "bold"), bg="white", fg="#333333",
                                   padx=4, pady=4, borderwidth=1, relief="solid")
-        traj_frame.pack(fill="both", expand=True, pady=(0, 0))
+        hist_frame.pack(fill="both", expand=True, pady=(0, 4))
         
-        self.traj_fig = Figure(figsize=(4.2, 3.2), tight_layout=True, facecolor="white")
-        self.traj_ax = self.traj_fig.add_subplot(111)
-        self.traj_ax.set_facecolor("#f5f5f5")
-        self.traj_ax.tick_params(colors="#666666", labelsize=8)
-        self.traj_ax.spines["bottom"].set_color("#999999")
-        self.traj_ax.spines["left"].set_color("#999999")
-        self.traj_ax.spines["top"].set_visible(False)
-        self.traj_ax.spines["right"].set_visible(False)
-        self.traj_line_meas, = self.traj_ax.plot([], [], "r.-", label="medido", linewidth=2)
-        self.traj_line_filt, = self.traj_ax.plot([], [], "#333333", marker=".", label="filtrado", linewidth=2)
-        legend = self.traj_ax.legend(facecolor="#f5f5f5", edgecolor="#999999", labelcolor="#333333")
-        self.traj_canvas = FigureCanvasTkAgg(self.traj_fig, master=traj_frame)
-        self.traj_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.hist_fig = Figure(figsize=(4.2, 2.0), tight_layout=True, facecolor="white")
+        self.hist_ax = self.hist_fig.add_subplot(111)
+        self._style_ax(self.hist_ax)
+        self.hist_canvas = FigureCanvasTkAgg(self.hist_fig, master=hist_frame)
+        self.hist_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Scatter Frame (Dispersão)
+        scatter_frame = tk.LabelFrame(self.right_frame, text="Dispersão dos Erros (assinados)", 
+                                  font=("Segoe UI", 10, "bold"), bg="white", fg="#333333",
+                                  padx=4, pady=4, borderwidth=1, relief="solid")
+        scatter_frame.pack(fill="both", expand=True, pady=(0, 0))
+        
+        self.scatter_fig = Figure(figsize=(4.2, 2.0), tight_layout=True, facecolor="white")
+        self.scatter_ax = self.scatter_fig.add_subplot(111)
+        self._style_ax(self.scatter_ax)
+        self.scatter_canvas = FigureCanvasTkAgg(self.scatter_fig, master=scatter_frame)
+        self.scatter_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         # Store config
         self.config_Q = None
         self.config_R = None
         self.config_detector_noise = 1.0
         self.video_fps = 30.0
-        
-        # Pre-calculate metrics for optimization
-        self.rmsx_cached = None
-        self.rmsy_cached = None
         self.metrics_update_counter = 0
 
-        # Playback poll
-        self.root.after(33, self._poll_playback)
+        self.rmsx_cached = None
+        self.rmsy_cached = None
+
+    def update_towers_from_gui(self):
+        """Lê os inputs da interface gráfica e atualiza a variável self.towers."""
+        self.towers = []
+        try:
+            for idx, (ent_x, ent_y) in enumerate(self.tower_entries):
+                x = float(ent_x.get().strip())
+                y = float(ent_y.get().strip())
+                self.towers.append((x, y))
+        except ValueError:
+            # Caso o usuário digite algo inválido, assume coordenadas padrão de segurança
+            self.towers = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (10.0, 10.0)]
 
     def _on_escape(self, event=None):
         try:
@@ -445,55 +565,117 @@ class KalmanApp:
         self.status_lbl.config(text="Status: Pronto para executar")
 
     def execute_processing(self):
-        """Process video and save to src/data/"""
-        if not self.video_path or self.processing:
+        """Prepara e inicia a thread correta dependendo do modo selecionado."""
+        if self.sim_mode.get() == "visao_computacional" and not getattr(self, 'video_path', None):
+            messagebox.showwarning("Aviso", "Por favor, carregue um vídeo primeiro.")
             return
-        
+            
+        if getattr(self, 'processing', False):
+            return
+            
         try:
             self._parse_config()
         except Exception as e:
             error_msg = traceback.format_exc()
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro nas configurações: {error_msg}"))
             self.processing = False
-            return  # Para a execução IMEDIATAMENTE se houver erro!
+            return
+
+        self.show_traj_val = self.show_traj.get()
+        self.show_detect_val = self.show_detect.get()
+        self.show_kalman_val = self.show_kalman.get()
+        self.show_window_val = self.show_window.get()
         
-        # Inicia o processamento apenas se o try acima deu certo
+        # Altera estado visual da UI (Em processo)
         self.processing = True
         self.exec_btn.config(state="disabled")
         self.load_btn.config(state="disabled")
-        self.status_lbl.config(text="Status: Processando...")
-        
-        self.worker = threading.Thread(target=self._process_video, daemon=True)
+        self.status_lbl.config(text="Status: Processando...", fg="#ca8a04") # Amarelo Dark
+        self.det_rate_lbl.config(text="Taxa de Detecção: Calculando...")
+        self.inlier_rate_lbl.config(text="Inliers (na Janela): Calculando...")
+
+        # Escolhe a Thread
+        if self.sim_mode.get() == "visao_computacional":
+            self.worker = threading.Thread(target=self._process_video, daemon=True)
+        else:
+            self.worker = threading.Thread(target=self._process_robot_simulation, daemon=True)
+            
         self.worker.start()
 
+
+    def _style_ax(self, ax):
+        """Aplica o estilo visual limpo para os eixos do Matplotlib."""
+        ax.set_facecolor("#f5f5f5")
+        ax.tick_params(colors="#666666", labelsize=8)
+        ax.spines["bottom"].set_color("#999999")
+        ax.spines["left"].set_color("#999999")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, alpha=0.3, linestyle="--")
+
     def _parse_config(self):
-        """Parse Q, R and detector noise from UI."""
-        # Parse Q from individual entries
+        """Parse Q, R, detector noise, e localização das Torres da UI.
+        O erro do detector é lido em metros e convertido para pixels."""
+        import numpy as np # Certifique-se de que o numpy está importado no topo do arquivo
+
+        # 1. Parse Q from individual entries
         q_vals = []
         for entry in self.q_entries:
             val_str = entry.get().strip()
-            try:
-                q_vals.append(float(val_str))
-            except ValueError:
-                q_vals.append(1e-2)
+            try: q_vals.append(float(val_str))
+            except ValueError: q_vals.append(1e-2)
         
-        # Parse R from individual entries
+        # 2. Parse R from individual entries
         r_vals = []
         for entry in self.r_entries:
             val_str = entry.get().strip()
-            try:
-                r_vals.append(float(val_str))
-            except ValueError:
-                r_vals.append(1e-1)
-        
-        # Parse detector noise value
-        try:
-            self.config_detector_noise = float(self.detector_noise_entry.get().strip())
-        except ValueError:
-            self.config_detector_noise = 4.0
+            try: r_vals.append(float(val_str))
+            except ValueError: r_vals.append(1e-1)
 
+        # 3. Parse Torres (NOVO)
+        towers_temp = []
+        if hasattr(self, 'tower_entries'):
+            for ent_x, ent_y in self.tower_entries:
+                try:
+                    x = float(ent_x.get().strip())
+                    y = float(ent_y.get().strip())
+                    towers_temp.append([x, y])
+                except ValueError:
+                    # Em caso de erro de digitação, salva na origem (0,0)
+                    towers_temp.append([0.0, 0.0])
+            
+            # Converte para Numpy Array (ideal para cálculos matriciais no seu Robot EKF)
+            self.towers = np.array(towers_temp)
+            
+        # 4. Obtém o erro digitado na interface em METROS
+        try:
+            erro_metros = float(self.detector_noise_entry.get().strip())
+        except ValueError:
+            erro_metros = 1.0
+
+        # Recalcular as proporções baseadas na dimensão atual
+        # Tratamento de segurança caso max_x ou max_y sejam 0 ou nulos
+        max_x = self.max_x if hasattr(self, 'max_x') and self.max_x > 0 else 1.0
+        max_y = self.max_y if hasattr(self, 'max_y') and self.max_y > 0 else 1.0
+
+        px_m_x = self.video_width / max_x
+        px_m_y = self.video_height / max_y
+        
+        # 5. Salva o ruído nas DUAS métricas (Pixels e Metros)
+        # -> Pixels: usado no modo Visão Computacional (detect_centroid)
+        self.config_detector_noise = px_m_x * erro_metros   
+        # -> Metros: usado no modo Localização Robótica EKF (detect_robot)
+        self.config_detector_noise_m = erro_metros          
+
+        # 6. Opcional: atualiza a label da dashboard se ela já existir
+        if hasattr(self, 'erro_sensor_lbl'):
+            avg_scale_px_m = (px_m_x + px_m_y) / 2.0
+            erro_px = erro_metros * avg_scale_px_m
+            self.erro_sensor_lbl.config(text=f"⚡ Erro Simulado: {erro_metros:.4f} m ≈ {erro_px:.2f} px")
+
+        # 7. Salva as configurações das matrizes
         self.config_Q = q_vals[:6]  
-        self.config_R = r_vals[:2]  
+        self.config_R = r_vals[:2]
 
     def _process_video(self):
         """Process video with Kalman filter and save to src/data/."""
@@ -517,7 +699,12 @@ class KalmanApp:
             q_vals = self.config_Q if len(self.config_Q) >= 6 else self.config_Q + [1e-1] * (6 - len(self.config_Q))
             r_vals = self.config_R[:2] if len(self.config_R) >= 2 else self.config_R + [1e-1]
 
-            kf = Entidy(dt=dt, q_diag=q_vals[:6], r_diag=r_vals[:2])
+            # ===== ALTERAÇÃO DE MODO: INSTANCIAÇÃO DA ENTIDADE =====
+            modo_atual = self.sim_mode.get()
+            if modo_atual == "localizacao_robotica":
+                kf = Robot(dt=dt, q_diag=q_vals[:6], r_diag=r_vals[:2])
+            else:
+                kf = Entidy(dt=dt, q_diag=q_vals[:6], r_diag=r_vals[:2])
             
             self.saved_Q = kf.Q if hasattr(kf, 'Q') else np.diag(q_vals[:6])
             self.saved_R = kf.R if hasattr(kf, 'R') else np.diag(r_vals[:2])
@@ -541,7 +728,12 @@ class KalmanApp:
                 if not ret:
                     break
                 
-                meas_px = detect_centroid(frame, noise_std=self.config_detector_noise)
+                # ===== ALTERAÇÃO DE MODO: DETECÇÃO CONDICIONAL =====
+                if modo_atual == "localizacao_robotica":
+                    meas_px = detect_bot(frame, noise_std=self.config_detector_noise, towers=self.towers)
+                else:
+                    meas_px = detect_centroid(frame, noise_std=self.config_detector_noise)
+                
                 meas_m = self.world_m.img2world(meas_px[0], meas_px[1]) if meas_px is not None else None
                 
                 # 1. PREDIÇÃO (A Priori)
@@ -550,7 +742,6 @@ class KalmanApp:
                 P_pred = kf.P.copy() if hasattr(kf, 'P') else None
 
                 # Calcula o ROI Previsto (Matriz S) independentemente de haver medição
-                # Isso permite desenhar o ROI (área de busca) durante o vídeo todo
                 if P_pred is not None:
                     S = P_pred[:2, :2] + np.diag(r_vals[:2])
                     std_innov_x_m = max(self.min_window_m, np.sqrt(S[0, 0]) * 3)
@@ -610,43 +801,43 @@ class KalmanApp:
 
                 self.filt_pts.append((ex, ey))
 
-                # --- RENDERIZAÇÃO GRÁFICA ---
+                # --- RENDERIZAÇÃO GRÁFICA CORRIGIDA (BGR) ---
                 ann = frame.copy()
-                if self.show_traj.get() and len(self.filt_pts) >= 2:
+                
+                # 🟩 Desenha trajetória filtrada (Verde)
+                if self.show_traj_val and len(self.filt_pts) >= 2:
                     filt_poly = [self.world_m.world2img(p[0], p[1]) for p in self.filt_pts if p is not None]
                     if len(filt_poly) >= 2:
-                        cv2.polylines(ann, [np.array(filt_poly, dtype=np.int32)], False, YELLOW_COLOR, 2)
+                        cv2.polylines(ann, [np.array(filt_poly, dtype=np.int32)], False, GREEN_COLOR, 2)
 
-                if self.show_detect.get() and len(self.meas_pts) >= 2:
+                # 🔴 Desenha linha tracejada da detecção histórica (Vermelho)
+                if self.show_detect_val and len(self.meas_pts) >= 2:
                     meas_poly = [self.world_m.world2img(p[0], p[1]) for p in self.meas_pts if p is not None]
                     if len(meas_poly) >= 2:
-                        cv2.polylines(ann, [np.array(meas_poly, dtype=np.int32)], False, GREEN_COLOR, 1)
+                        cv2.polylines(ann, [np.array(meas_poly, dtype=np.int32)], False, RED_COLOR, 1)
 
-                # DESENHA A JANELA DE KALMAN (ROI PREVISTO PARA ESTE FRAME) E O CENTRO
-                if self.show_window.get() and pos_pred is not None:
-                    # Usa a predição e std_innov (S) para desenhar a área esperada
+                # 🟦 Desenha a Janela de Kalman / ROI (Cyan - YELLOW_COLOR) e o centro previsto
+                if self.show_window_val and pos_pred is not None:
                     px1, py1 = self.world_m.world2img(pos_pred[0] - std_innov_x_m, pos_pred[1] + std_innov_y_m)
                     px2, py2 = self.world_m.world2img(pos_pred[0] + std_innov_x_m, pos_pred[1] - std_innov_y_m)
                     
-                    # Retângulo Verde
                     cv2.rectangle(ann, 
                                   (max(0, min(w, int(px1))), max(0, min(h, int(py1)))),
                                   (max(0, min(w, int(px2))), max(0, min(h, int(py2)))),
-                                  (0, 255, 0), 2)
+                                  YELLOW_COLOR, 2)
                     
-                    # Ponto verde bem pequeno no centro do ROI (Predição)
                     cx, cy = self.world_m.world2img(pos_pred[0], pos_pred[1])
-                    cv2.circle(ann, (int(cx), int(cy)), 2, (0, 255, 0), -1)
+                    cv2.circle(ann, (int(cx), int(cy)), 2, YELLOW_COLOR, -1)
 
-                # Desenha o Kalman Atualizado (A Posteriori) como bolinha azul
-                est_px = self.world_m.world2img(est_m[0], est_m[1])
-                if self.show_kalman.get():
-                    cv2.circle(ann, (int(est_px[0]), int(est_px[1])), 6, BLUE_COLOR, -1)
-
-                # Desenha a Detecção como bolinha (Ciano ou vermelha se estiver fora, opcional no futuro)
-                if self.show_detect.get() and meas_m is not None:
+                # 🔴 Desenha a Detecção Atual do Frame como uma bolinha vermelha sólida
+                if self.show_detect_val and meas_m is not None:
                     valid_px = self.world_m.world2img(meas_m[0], meas_m[1])
-                    cv2.circle(ann, (int(valid_px[0]), int(valid_px[1])), 6, (255, 0, 0), -1)
+                    cv2.circle(ann, (int(valid_px[0]), int(valid_px[1])), 6, RED_COLOR, -1)
+
+                # 🟦 Desenha o Kalman Corrigido (A Posteriori) como uma bolinha azul sólida por cima
+                est_px = self.world_m.world2img(est_m[0], est_m[1])
+                if self.show_kalman_val:
+                    cv2.circle(ann, (int(est_px[0]), int(est_px[1])), 4, BLUE_COLOR, -1)
 
                 out.write(ann)
                 frame_count += 1
@@ -667,6 +858,164 @@ class KalmanApp:
         finally:
             self.processing = False
             if cap is not None: cap.release()
+            if out is not None: out.release()
+    
+    def _process_robot_simulation(self):
+        """Gera a Arena Sintética com EKF e grava como output.mp4 sem precisar de vídeos prévios."""
+        out = None
+        try:
+            fps = 30.0
+            self.fps = fps
+            w, h = self.video_width, self.video_height
+            
+            os.makedirs("FiltroKalman/src/data", exist_ok=True)
+            output_path = "FiltroKalman/src/data/output.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+            
+            self.world_m = World(dimPX=w, dimPY=h, dimPOX=self.max_x, dimPOY=self.max_y)
+            dt = 1.0 / fps
+            
+            q_vals = self.config_Q if len(self.config_Q) >= 6 else self.config_Q + [1e-1] * (6 - len(self.config_Q))
+            r_vals = self.config_R[:2] if len(self.config_R) >= 2 else self.config_R + [1e-1]
+
+            # Instanciação da Entidade Robótica (EKF)
+            kf = Robot(dt=dt, q_diag=q_vals[:6], r_diag=r_vals[:2])
+            
+            # Inicialização de Variáveis e Arrays de Métricas
+            total_frames_sim = 450 # Exemplo: 15 segundos de simulação
+            self.total_frames = total_frames_sim
+            frame_count = 0
+            frames_with_meas = 0        
+            self.meas_inside_roi = 0         
+            self.meas_pts, self.filt_pts, self.sqerr_x, self.sqerr_y = [], [], [], []
+            self.kalman_windows, self.nis_vals, self.innov_x, self.innov_y = [], [], [], []
+
+            for frame_idx in range(total_frames_sim):
+                # 1. Cria Fundo Escuro para a Arena Cartesiana
+                frame = np.zeros((h, w, 3), dtype=np.uint8)
+                
+                # 2. Desenha as Torres Configuradas e salvas no parse_config
+                if hasattr(self, 'towers') and self.towers is not None:
+                    for i, (tx, ty) in enumerate(self.towers):
+                        tpx, tpy = self.world_m.world2img(tx, ty)
+                        cv2.circle(frame, (int(tpx), int(tpy)), 10, (200, 200, 200), 2)
+                        cv2.putText(frame, f"T{i+1}", (int(tpx)-12, int(tpy)-15), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+                # =================================================================
+                # INTEGRAÇÃO DO FUTURO GERADOR DE TRAJETÓRIAS:
+                # x_true, y_true = meu_gerador.gerar(frame_idx, mode="laminescata")
+                # =================================================================
+                # Movimento Circular Provisório:
+                angulo = frame_idx * (2 * np.pi / total_frames_sim)
+                x_true = (self.max_x / 2.0) + (self.max_x / 3.0) * np.cos(angulo)
+                y_true = (self.max_y / 2.0) + (self.max_y / 3.0) * np.sin(angulo)
+                
+                # Renderiza a posição Verdadeira do Robô (Ground Truth) em Branco
+                gt_px = self.world_m.world2img(x_true, y_true)
+                cv2.circle(frame, (int(gt_px[0]), int(gt_px[1])), 6, (255, 255, 255), -1)
+
+                # 3. Medição Simulada pelo EKF
+                meas_px = detect_bot(frame, noise_std=self.config_detector_noise_m, towers=self.towers)
+                meas_m = self.world_m.img2world(meas_px[0], meas_px[1]) if meas_px is not None else None
+                
+                # 4. PREDIÇÃO EKF
+                kf.predict()
+                pos_pred = kf.get_position()  
+                P_pred = kf.P.copy() if hasattr(kf, 'P') else None
+
+                if P_pred is not None:
+                    S = P_pred[:2, :2] + np.diag(r_vals[:2])
+                    std_innov_x_m = max(self.min_window_m, np.sqrt(S[0, 0]) * 3)
+                    std_innov_y_m = max(self.min_window_m, np.sqrt(S[1, 1]) * 3)
+                else:
+                    std_innov_x_m = self.min_window_m
+                    std_innov_y_m = self.min_window_m
+
+                if meas_m is not None:
+                    innov = np.array([meas_m[0] - pos_pred[0], meas_m[1] - pos_pred[1]])
+                    self.innov_x.append(innov[0])
+                    self.innov_y.append(innov[1])
+                    if P_pred is not None:
+                        try:
+                            nis = innov @ np.linalg.inv(S) @ innov
+                        except np.linalg.LinAlgError:
+                            nis = np.nan
+                    else: nis = np.nan
+                        
+                    self.nis_vals.append(nis)
+
+                    # Gating
+                    if abs(innov[0]) <= std_innov_x_m and abs(innov[1]) <= std_innov_y_m:
+                        self.meas_inside_roi += 1
+                        
+                    # ATUALIZAÇÃO EKF
+                    kf.update(meas_m)
+                    frames_with_meas += 1
+                else:
+                    self.innov_x.append(np.nan)
+                    self.innov_y.append(np.nan)
+                    self.nis_vals.append(np.nan)
+
+                # 5. ANÁLISE DE ERROS BASEADA NO "GROUND TRUTH" E DESENHO
+                est_m = kf.get_position()
+                self.kalman_windows.append(P_pred) 
+
+                if meas_m is None:
+                    self.meas_pts.append(None)
+                    self.sqerr_x.append(np.nan)
+                    self.sqerr_y.append(np.nan)
+                else:
+                    self.meas_pts.append((float(meas_m[0]), float(meas_m[1])))
+                    # VANTAGEM DE EKF SINTÉTICO: O erro matemático real é calculado
+                    # contra a posição do gerador (x_true, y_true), e não contra a medição viciada!
+                    self.sqerr_x.append((est_m[0] - x_true) ** 2)
+                    self.sqerr_y.append((est_m[1] - y_true) ** 2)
+
+                self.filt_pts.append((float(est_m[0]), float(est_m[1])))
+
+                # Desenhos (Copiam integralmente o seu _process_video normal)
+                ann = frame.copy()
+                if self.show_traj_val and len(self.filt_pts) >= 2:
+                    filt_poly = [self.world_m.world2img(p[0], p[1]) for p in self.filt_pts if p is not None]
+                    if len(filt_poly) >= 2: cv2.polylines(ann, [np.array(filt_poly, dtype=np.int32)], False, GREEN_COLOR, 2)
+
+                if self.show_detect_val and len(self.meas_pts) >= 2:
+                    meas_poly = [self.world_m.world2img(p[0], p[1]) for p in self.meas_pts if p is not None]
+                    if len(meas_poly) >= 2: cv2.polylines(ann, [np.array(meas_poly, dtype=np.int32)], False, RED_COLOR, 1)
+
+                if self.show_window_val and pos_pred is not None:
+                    px1, py1 = self.world_m.world2img(pos_pred[0] - std_innov_x_m, pos_pred[1] + std_innov_y_m)
+                    px2, py2 = self.world_m.world2img(pos_pred[0] + std_innov_x_m, pos_pred[1] - std_innov_y_m)
+                    cv2.rectangle(ann, (max(0, min(w, int(px1))), max(0, min(h, int(py1)))), (max(0, min(w, int(px2))), max(0, min(h, int(py2)))), YELLOW_COLOR, 2)
+                    cx, cy = self.world_m.world2img(pos_pred[0], pos_pred[1])
+                    cv2.circle(ann, (int(cx), int(cy)), 2, YELLOW_COLOR, -1)
+
+                if self.show_detect_val and meas_m is not None:
+                    valid_px = self.world_m.world2img(meas_m[0], meas_m[1])
+                    cv2.circle(ann, (int(valid_px[0]), int(valid_px[1])), 6, RED_COLOR, -1)
+
+                if self.show_kalman_val:
+                    est_px = self.world_m.world2img(est_m[0], est_m[1])
+                    cv2.circle(ann, (int(est_px[0]), int(est_px[1])), 4, BLUE_COLOR, -1)
+
+                out.write(ann)
+                frame_count += 1
+
+            # Finalização Segura
+            self.total_frames = frame_count
+            self.detection_rate = (frames_with_meas / frame_count * 100.0) if frame_count > 0 else 0.0
+            self.inlier_rate = (self.meas_inside_roi / frames_with_meas * 100.0) if frames_with_meas > 0 else 0.0
+            
+            self.processed_video_path = output_path
+            self.root.after(0, self._on_processing_complete)
+            
+        except Exception as e:
+            errorMsg = traceback.format_exc()
+            self.root.after(0, lambda: messagebox.showerror("Erro na Simulação EKF", f"Erro: {errorMsg}"))
+        finally:
+            self.processing = False
             if out is not None: out.release()
 
     def _find_convergence_frame(self, running_rms, final_val, tol=0.05, min_stable=10):
@@ -717,8 +1066,8 @@ class KalmanApp:
             ys_meas = [p[1] for p in self.meas_pts if p is not None]
             xs_filt = [p[0] for p in self.filt_pts]
             ys_filt = [p[1] for p in self.filt_pts]
-            ax1.plot(xs_meas, ys_meas, "r.-", label="Medido", linewidth=1, markersize=4, alpha=0.5)
-            ax1.plot(xs_filt, ys_filt, "#333333", label="Kalman Filtrado", linewidth=2.5, alpha=0.9)
+            ax1.plot(xs_meas, ys_meas, "r.-", label="Medido (Detector)", linewidth=1, markersize=4, alpha=0.5)
+            ax1.plot(xs_filt, ys_filt, "g-", label="Kalman Filtrado", linewidth=2.5, alpha=0.9)
             ax1.set_xlabel("Posição X (metros)", fontweight="bold")
             ax1.set_ylabel("Posição Y (metros)", fontweight="bold")
             ax1.set_title(f"Trajetória Espacial | Detecções: {self.detection_rate:.1f}% | Inliers: {self.inlier_rate:.1f}%", fontweight="bold")
@@ -768,7 +1117,7 @@ class KalmanApp:
             if valid_nis:
                 ax4.plot(frames_nis, valid_nis, 'm-', alpha=0.7, label="NIS Calculado")
                 ax4.axhline(5.99, color='r', linestyle='--', linewidth=2, label="Limite 95% Confiança (χ²)")
-                ax4.set_ylim(0, max(15, np.percentile(valid_nis, 95) * 1.5))
+                ax4.set_ylim(0, max(15, float(np.percentile(valid_nis, 95) * 1.5)))
             ax4.set_xlabel("Frames", fontweight="bold")
             ax4.set_ylabel("Valor NIS", fontweight="bold")
             ax4.set_title("Teste de Consistência NIS (covariância corrigida)", fontweight="bold")
@@ -887,31 +1236,49 @@ class KalmanApp:
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao gerar relatórios: {error_msg}"))
         finally:
             self.processing = False
-            
+
     def _on_processing_complete(self):
-        """Seletor de interface chamado ao finalizar o processamento."""
-        self.status_lbl.config(text=f"Status: Concluído | Detecção: {self.inlier_rate:.1f}%")
-        self.exec_btn.config(state="normal")
-        self.load_btn.config(state="normal")
+        """Seletor de interface chamado ao finalizar o processamento em qualquer modo."""
+        # 1. Atualiza o status visual do painel esquerdo
+        self.status_lbl.config(text="Status: Concluído", fg="#16a34a") # Verde para OK
+        
+        # 2. Atualiza as métricas da Simulação
+        detec_val = getattr(self, 'detection_rate', 0)
+        inlier_val = getattr(self, 'inlier_rate', 0)
+        self.det_rate_lbl.config(text=f"Taxa de Detecção: {detec_val:.1f}%")
+        self.inlier_rate_lbl.config(text=f"Inliers (na Janela): {inlier_val:.1f}%")
+        
+        # 3. Restaura os botões de controle
+        self.save_btn.config(state="normal")
+        self._on_mode_change()  
+        self.processing = False
 
-        if self.processed_video_path:
-            self.cap = cv2.VideoCapture(self.processed_video_path)
-            self.video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.current_frame_idx = 0
+        if hasattr(self, 'processed_video_path') and os.path.exists(self.processed_video_path):
+            try:
+                # Aqui você chama o método do SEU VideoViewer que carrega o vídeo. 
+                # Pode ser .open_video(), .load(), .set_video(), dependendo de como você o programou.
+                # Assumindo que seja open_video:
+                if hasattr(self.tela_viewer, 'open_video'):
+                    self.tela_viewer.open_video(self.processed_video_path)
+                elif hasattr(self.tela_viewer, 'load_video'):
+                    self.tela_viewer.load_video(self.processed_video_path)
+                
+                # Destrava os botões do player central
+                self.play_btn.config(state="normal")
+                self.prev_btn.config(state="normal")
+                self.next_btn.config(state="normal")
 
-            ret, frame = self.cap.read()
-            if ret:
-                self.tela_viewer.display_image(frame)
-                total_time = self.total_frames / self.video_fps
-                self.time_info_lbl.config(text=f"00:00 / {self._format_time(total_time)}")
+                # Se você tiver métodos que plotam os gráficos na tela (Matplotlib),
+                # essa é a hora de chamá-los!
+                if hasattr(self, 'plot_results'):
+                    self.plot_results()
 
-            self.prev_btn.config(state="normal")
-            self.play_btn.config(state="normal")
-            self.next_btn.config(state="normal")
-            self.save_btn.config(state="normal")
+            except Exception as e:
+                messagebox.showerror("Erro de Reprodução", f"Erro ao tentar abrir o vídeo gerado: {str(e)}")
+        else:
+            messagebox.showerror("Erro", "O arquivo processado não foi encontrado na pasta.")
 
-            self._update_metrics_plots()
+
     def toggle_playback(self):
         if not self.cap:
             return
@@ -969,7 +1336,7 @@ class KalmanApp:
         
         current_idx = self.current_frame_idx + 1
         
-        # RMS X (metros)
+        # --- RMS X e Y (mantidos como antes) ---
         sx = np.array([v for v in self.sqerr_x[:current_idx] if not (v is None or np.isnan(v))], dtype=float)
         if sx.size > 0:
             running_mean_x = np.cumsum(sx) / np.arange(1, sx.size + 1)
@@ -978,7 +1345,6 @@ class KalmanApp:
             self.rmsx_ax.set_xlim(0, max(10, len(running_rms_x)))
             self.rmsx_ax.set_ylim(0, max(0.1, running_rms_x.max() * 1.2))
         
-        # RMS Y (metros)
         sy = np.array([v for v in self.sqerr_y[:current_idx] if not (v is None or np.isnan(v))], dtype=float)
         if sy.size > 0:
             running_mean_y = np.cumsum(sy) / np.arange(1, sy.size + 1)
@@ -987,25 +1353,40 @@ class KalmanApp:
             self.rmsy_ax.set_xlim(0, max(10, len(running_rms_y)))
             self.rmsy_ax.set_ylim(0, max(0.1, running_rms_y.max() * 1.2))
         
-        # Trajetória Cartesiana em Metros (Orientação padrão: y cresce para cima)
-        xs_meas = [p[0] for p in self.meas_pts[:current_idx] if p is not None]
-        ys_meas = [p[1] for p in self.meas_pts[:current_idx] if p is not None]
-        xs_filt = [p[0] for p in self.filt_pts[:current_idx]]
-        ys_filt = [p[1] for p in self.filt_pts[:current_idx]]
+        # --- Cálculo dos Erros Assinados (dx, dy) para o frame atual ---
+        signed_dx = []
+        signed_dy = []
+        for m_pt, f_pt in zip(self.meas_pts[:current_idx], self.filt_pts[:current_idx]):
+            if m_pt is not None and f_pt is not None:
+                signed_dx.append(f_pt[0] - m_pt[0])
+                signed_dy.append(f_pt[1] - m_pt[1])
+
+        # --- Atualização do Histograma ---
+        self.hist_ax.clear()
+        self._style_ax(self.hist_ax)
+        if signed_dx and signed_dy:
+            self.hist_ax.hist(signed_dx, bins=20, alpha=0.5, color='blue', label='Erros X')
+            self.hist_ax.hist(signed_dy, bins=20, alpha=0.5, color='orange', label='Erros Y')
+            self.hist_ax.legend(loc='upper right', fontsize=7, facecolor="#f5f5f5", edgecolor="#999999")
         
-        if xs_meas and ys_meas:
-            self.traj_line_meas.set_data(xs_meas, ys_meas)
-        self.traj_line_filt.set_data(xs_filt, ys_filt)
-        
-        if xs_filt and ys_filt:
-            x_max = max(xs_filt)
-            y_max = max(ys_filt)
-            self.traj_ax.set_xlim(0, max(2.0, x_max * 1.1))
-            self.traj_ax.set_ylim(0, max(2.0, y_max * 1.1)) # Removida a inversão de tela no gráfico Matplotlib!
-        
+        # --- Atualização da Dispersão ---
+        self.scatter_ax.clear()
+        self._style_ax(self.scatter_ax)
+        if signed_dx and signed_dy:
+            self.scatter_ax.scatter(signed_dx, signed_dy, alpha=0.5, c='purple', edgecolors='k', s=15)
+            self.scatter_ax.axhline(0, color='black', linewidth=1, alpha=0.5)
+            self.scatter_ax.axvline(0, color='black', linewidth=1, alpha=0.5)
+            
+            # Ajusta os limites para manter a origem (0,0) centralizada e acompanhar erros maiores
+            max_err = max(max(np.abs(signed_dx)), max(np.abs(signed_dy)), 0.1)
+            self.scatter_ax.set_xlim(-max_err * 1.2, max_err * 1.2)
+            self.scatter_ax.set_ylim(-max_err * 1.2, max_err * 1.2)
+
+        # Redesenha os canvas para a interface gráfica exibir
         self.rmsx_canvas.draw_idle()
         self.rmsy_canvas.draw_idle()
-        self.traj_canvas.draw_idle()
+        self.hist_canvas.draw_idle()
+        self.scatter_canvas.draw_idle()
 
 def run_app():
     root = tk.Tk()
