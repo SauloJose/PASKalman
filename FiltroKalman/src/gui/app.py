@@ -712,6 +712,8 @@ class KalmanApp:
                 if not ret:
                     break
                 
+                # Para uma lógica de Visão Ativa completa no futuro, 
+                # o detect_centroid poderia receber o 'est_m' do frame anterior aqui.
                 meas_px = detect_centroid(frame, noise_std=self.config_detector_noise)
                 meas_m = self.world_m.img2world(meas_px[0], meas_px[1]) if meas_px is not None else None
                 
@@ -720,6 +722,7 @@ class KalmanApp:
                 pos_pred = kf.get_position()  
                 P_pred = kf.P.copy() if hasattr(kf, 'P') else None
 
+                # A incerteza (S) teórica continua sendo calculada via Predição
                 if P_pred is not None:
                     S = P_pred[:2, :2] + np.diag(r_vals[:2])
                     std_innov_x_m = max(self.min_window_m, np.sqrt(S[0, 0]) * 3)
@@ -729,6 +732,7 @@ class KalmanApp:
                     std_innov_y_m = self.min_window_m
 
                 if meas_m is not None:
+                    # Inovação a priori (Apenas para fins estatísticos como o NIS)
                     innov = np.array([meas_m[0] - pos_pred[0], meas_m[1] - pos_pred[1]])
                     self.innov_x.append(innov[0])
                     self.innov_y.append(innov[1])
@@ -744,13 +748,6 @@ class KalmanApp:
                         
                     self.nis_vals.append(nis)
 
-                    # --- VALIDAÇÃO DA MEDIÇÃO (GATING) ---
-                    dist_x = abs(innov[0])
-                    dist_y = abs(innov[1])
-
-                    if dist_x <= std_innov_x_m and dist_y <= std_innov_y_m:
-                        self.meas_inside_roi += 1
-                        
                     # 2. ATUALIZAÇÃO (A Posteriori)
                     kf.update(meas_m)
                     frames_with_meas += 1
@@ -764,18 +761,27 @@ class KalmanApp:
                 est_m = kf.get_position()
                 P_mat = kf.P.copy() if hasattr(kf, 'P') else None
 
-                # ========== CÁLCULO DO REGIME ESTACIONÁRIO ==========
+                # --- LÓGICA DO ROI E AVALIAÇÃO DA PREVISÃO (A POSTERIORI) ---
+                if est_m is not None and meas_m is not None:
+                    innov_posteriori = np.array([meas_m[0] - est_m[0], meas_m[1] - est_m[1]])
+
+                    dist_x = abs(innov_posteriori[0])
+                    dist_y = abs(innov_posteriori[1])
+
+                    # Consideramos "Inlier" se a medição ficou dentro da janela de incerteza da estimativa final
+                    if dist_x <= std_innov_x_m and dist_y <= std_innov_y_m:
+                        self.meas_inside_roi += 1
+
+                # CÁLCULO DO REGIME ESTACIONÁRIO 
                 if not getattr(self, 'steady_state_reached', False) and P_mat is not None and len(self.kalman_windows) > 0:
                     P_prev = self.kalman_windows[-1]
                     if P_prev is not None:
-                        # Verifica a variação através do traço da diferença absoluta das matrizes
                         variacao_P = np.trace(np.abs(P_mat - P_prev))
                         if variacao_P < 1e-2:
                             self.steady_state_reached = True
                             self.steady_state_frame = frame_count
                             tempo_segundos = frame_count / self.fps
                             
-                            # Dispara a atualização visual na Thread principal
                             self.root.after(0, lambda f=frame_count, t=tempo_segundos: 
                                 self.steady_state_lbl.config(
                                     text=f"Regime Estacionário: {t:.2f} s ({f} frames)", 
@@ -811,14 +817,15 @@ class KalmanApp:
                     if len(meas_poly) >= 2:
                         cv2.polylines(ann, [np.array(meas_poly, dtype=np.int32)], False, GREEN_COLOR, 1)
 
-                if self.show_window.get() and pos_pred is not None:
-                    px1, py1 = self.world_m.world2img(pos_pred[0] - std_innov_x_m, pos_pred[1] + std_innov_y_m)
-                    px2, py2 = self.world_m.world2img(pos_pred[0] + std_innov_x_m, pos_pred[1] - std_innov_y_m)
+                # DESENHO DA JANELA ANCORADA NO ESTADO A POSTERIORI (est_m)
+                if self.show_window.get() and est_m is not None:
+                    px1, py1 = self.world_m.world2img(est_m[0] - std_innov_x_m, est_m[1] + std_innov_y_m)
+                    px2, py2 = self.world_m.world2img(est_m[0] + std_innov_x_m, est_m[1] - std_innov_y_m)
                     cv2.rectangle(ann, 
                                   (max(0, min(w, int(px1))), max(0, min(h, int(py1)))),
                                   (max(0, min(w, int(px2))), max(0, min(h, int(py2)))),
                                   (0, 255, 0), 2)
-                    cx, cy = self.world_m.world2img(pos_pred[0], pos_pred[1])
+                    cx, cy = self.world_m.world2img(est_m[0], est_m[1])
                     cv2.circle(ann, (int(cx), int(cy)), 2, (0, 255, 0), -1)
 
                 est_px = self.world_m.world2img(est_m[0], est_m[1])
@@ -837,7 +844,6 @@ class KalmanApp:
             self.detection_rate = (frames_with_meas / frame_count * 100.0) if frame_count > 0 else 0.0
             self.inlier_rate = (self.meas_inside_roi / frames_with_meas * 100.0) if frames_with_meas > 0 else 0.0
             
-            # Transferência de cálculos matemáticos extraídos do save_results:
             self.rmse_x_total = np.sqrt(np.nanmean(self.sqerr_x)) if self.sqerr_x else 0.0
             self.rmse_y_total = np.sqrt(np.nanmean(self.sqerr_y)) if self.sqerr_y else 0.0
             
@@ -854,12 +860,10 @@ class KalmanApp:
             valid_nis = [n for n in self.nis_vals if not np.isnan(n)]
             self.mean_nis = np.mean(valid_nis) if valid_nis else 0.0
 
-            # Atualização das taxas antigas e compatibilidades de herança
             self.sensor_detection_rate = self.detection_rate
             self.roi_accuracy_rate = self.inlier_rate
             self.processed_video_path = output_path
 
-            # Encaminha a renderização final para a thread principal da UI atualizar as Labels
             self.root.after(0, self._update_ui_metrics_and_complete)
 
         except Exception as e:
@@ -869,7 +873,6 @@ class KalmanApp:
             self.processing = False
             if cap is not None: cap.release()
             if out is not None: out.release()
-
     def _update_ui_metrics_and_complete(self):
         """Atualiza dinamicamente as labels do painel esquerdo e executa callbacks finais."""
         # Status
