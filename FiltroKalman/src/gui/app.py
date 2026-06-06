@@ -38,9 +38,9 @@ class KalmanApp:
         
         # Dimensões reais desejadas
         self.max_x = 150 #metros
-        self.max_y = 100 #metros
+        self.max_y = 150 #metros
 
-        self.min_window_m = 3 #metros
+        self.min_window_m = 2.5 #metros
 
         # Maximize window
         try:
@@ -64,6 +64,7 @@ class KalmanApp:
         self.current_frame_idx = 0
         self.total_frames = 0
         self.detection_rate = 0.0  # Métrica de % de detecção estável
+        self.meas_inside_roi = 0 
 
         # Metrics data (Agora armazenados em METROS para os gráficos)
         self.meas_pts = []
@@ -130,7 +131,7 @@ class KalmanApp:
         ttk.Label(config_lbl_frame, text="Modelo: Entidy 6D [x, y, vx, vy, ax, ay]", 
                  font=("Segoe UI", 8, "bold"), foreground="#0066cc").pack(anchor="w", pady=(0, 6))
 
-        # NOVO INPUT: Erro do detector de centroide (Simulação de ruído do sensor)
+        #Erro do detector de centroide (Simulação de ruído do sensor)
         ttk.Label(config_lbl_frame, text="Erro do Detector (Ruído em Pixels):", 
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 2))
         self.detector_noise_entry = ttk.Entry(config_lbl_frame, width=12)
@@ -144,17 +145,25 @@ class KalmanApp:
         q_frame = tk.Frame(config_lbl_frame, bg="#f5f5f5")
         q_frame.pack(fill="x", pady=(0, 6))
         
-        q_labels = ["Q[0,0] (x)", "Q[1,1] (y)", "Q[2,2] (vx)", "Q[3,3] (vy)", "Q[4,4] (ax)", "Q[5,5](ay)"]
+        q_labels = ["Q[0,0] (x)", "Q[1,1] (y)", "Q[2,2] (vx)", "Q[3,3] (vy)", "Q[4,4] (ax)", "Q[5,5] (ay)"]
+        
+        # Valores padrão baseados na cinemática: Pos(1e-4), Vel(1e-2), Acel(1.0)
+        default_q_vals = ["5e-1", "5e-1", "5e-1", "5e-1", "5e-1", "5e-1"]
+        
         self.q_entries = []
         for i, label in enumerate(q_labels):
             col = i % 3
             row = i // 3
             lbl = tk.Label(q_frame, text=label, font=("Segoe UI", 7), bg="#f5f5f5")
             lbl.grid(row=row*2, column=col, sticky="w", padx=2, pady=(2, 0))
+            
             entry = ttk.Entry(q_frame, width=8)
-            entry.insert(0, "5e-1" if i < 2 else "1e-1")
+            # Insere o valor padrão correspondente ao índice atual
+            entry.insert(0, default_q_vals[i])
             entry.grid(row=row*2+1, column=col, sticky="ew", padx=2, pady=(0, 4))
+            
             self.q_entries.append(entry)
+            
         q_frame.columnconfigure(0, weight=1)
         q_frame.columnconfigure(1, weight=1)
         q_frame.columnconfigure(2, weight=1)
@@ -167,14 +176,23 @@ class KalmanApp:
         r_frame.pack(fill="x", pady=(0, 2))
         
         r_labels = ["R[0,0] (x)", "R[1,1] (y)"]
+        
+        # Valores padrão baseados na variância do erro em metros: 0.1m^2 = 0.01 = 1e-2
+        default_r_vals = ["1e-2", "1e-2"]
+        
         self.r_entries = []
         for i, label in enumerate(r_labels):
+            col = i % 2 
+            row = i // 2
             lbl = tk.Label(r_frame, text=label, font=("Segoe UI", 7), bg="#f5f5f5")
-            lbl.grid(row=0, column=i, sticky="w", padx=2, pady=(2, 0))
-            entry = ttk.Entry(r_frame, width=10)
-            entry.insert(0, "0.01")
-            entry.grid(row=1, column=i, sticky="ew", padx=2, pady=(0, 2))
+            lbl.grid(row=row*2, column=col, sticky="w", padx=2, pady=(2, 0))
+            
+            entry = ttk.Entry(r_frame, width=8)
+            entry.insert(0, default_r_vals[i])
+            entry.grid(row=row*2+1, column=col, sticky="ew", padx=2, pady=(0, 4))
+            
             self.r_entries.append(entry)
+            
         r_frame.columnconfigure(0, weight=1)
         r_frame.columnconfigure(1, weight=1)
 
@@ -351,7 +369,7 @@ class KalmanApp:
         # Store config
         self.config_Q = None
         self.config_R = None
-        self.config_detector_noise = 4.0
+        self.config_detector_noise = 1.0
         self.video_fps = 30.0
         
         # Pre-calculate metrics for optimization
@@ -484,7 +502,7 @@ class KalmanApp:
         try:
             cap = cv2.VideoCapture(self.video_path)
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            self.fps = fps  # guarda para uso posterior
+            self.fps = fps 
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
@@ -506,8 +524,8 @@ class KalmanApp:
             self.saved_Qd = getattr(kf, 'Qd', getattr(kf, 'Q_discrete', getattr(kf, 'Q_d', None)))
 
             frame_count = 0
-            frames_with_meas = 0        # frames em que houve alguma medição
-            valid_detections = 0        # medições dentro da janela 3-sigma
+            frames_with_meas = 0        
+            self.meas_inside_roi = 0         
 
             self.meas_pts = []
             self.filt_pts = []
@@ -515,8 +533,8 @@ class KalmanApp:
             self.sqerr_y = []
             self.kalman_windows = []
             self.nis_vals = []
-            self.innov_x = []           # inovação em X (medição - predição)
-            self.innov_y = []           # inovação em Y
+            self.innov_x = []           
+            self.innov_y = []           
 
             while True:
                 ret, frame = cap.read()
@@ -526,22 +544,27 @@ class KalmanApp:
                 meas_px = detect_centroid(frame, noise_std=self.config_detector_noise)
                 meas_m = self.world_m.img2world(meas_px[0], meas_px[1]) if meas_px is not None else None
                 
-                # Predição e guarda do estado predito
+                # 1. PREDIÇÃO (A Priori)
                 kf.predict()
-                pos_pred = kf.get_position()  # ou kf.x[0:2].copy()
+                pos_pred = kf.get_position()  
                 P_pred = kf.P.copy() if hasattr(kf, 'P') else None
 
+                # Calcula o ROI Previsto (Matriz S) independentemente de haver medição
+                # Isso permite desenhar o ROI (área de busca) durante o vídeo todo
+                if P_pred is not None:
+                    S = P_pred[:2, :2] + np.diag(r_vals[:2])
+                    std_innov_x_m = max(self.min_window_m, np.sqrt(S[0, 0]) * 3)
+                    std_innov_y_m = max(self.min_window_m, np.sqrt(S[1, 1]) * 3)
+                else:
+                    std_innov_x_m = self.min_window_m
+                    std_innov_y_m = self.min_window_m
+
                 if meas_m is not None:
-                    # Inovação (medição - predição)
                     innov = np.array([meas_m[0] - pos_pred[0], meas_m[1] - pos_pred[1]])
                     self.innov_x.append(innov[0])
                     self.innov_y.append(innov[1])
 
-                    # Covariância da inovação: S = H*P_pred*H' + R
-                    # Como H é [I_2x2, 0], S = P_pred[0:2,0:2] + R
                     if P_pred is not None:
-                        S = P_pred[:2, :2] + np.diag(r_vals[:2])
-                        # NIS = innov' * inv(S) * innov
                         try:
                             invS = np.linalg.inv(S)
                             nis = innov @ invS @ innov
@@ -549,26 +572,29 @@ class KalmanApp:
                             nis = np.nan
                     else:
                         nis = np.nan
+                        
                     self.nis_vals.append(nis)
 
-                    # Atualização
+                    # --- VALIDAÇÃO DA MEDIÇÃO (GATING) ---
+                    dist_x = abs(innov[0])
+                    dist_y = abs(innov[1])
+
+                    if dist_x <= std_innov_x_m and dist_y <= std_innov_y_m:
+                        self.meas_inside_roi += 1
+                        
+                    # 2. ATUALIZAÇÃO (A Posteriori)
                     kf.update(meas_m)
                     frames_with_meas += 1
+
                 else:
                     self.innov_x.append(np.nan)
                     self.innov_y.append(np.nan)
                     self.nis_vals.append(np.nan)
 
-                # Estado estimado (posterior)
+                # 3. GUARDAR ESTADOS FINAIS (A Posteriori)
                 est_m = kf.get_position()
                 P_mat = kf.P.copy() if hasattr(kf, 'P') else None
                 self.kalman_windows.append(P_mat)
-
-                # Variâncias para janela de confiança
-                var_x = float(P_mat[0, 0]) if P_mat is not None else 1e-6
-                var_y = float(P_mat[1, 1]) if P_mat is not None else 1e-6
-                std_x_m = max(self.min_window_m, np.sqrt(var_x) * 3)
-                std_y_m = max(self.min_window_m, np.sqrt(var_y) * 3)
 
                 if meas_m is None:
                     self.meas_pts.append(None)
@@ -582,13 +608,9 @@ class KalmanApp:
                     self.sqerr_x.append(dx ** 2)
                     self.sqerr_y.append(dy ** 2)
 
-                    # Contagem de inliers (dentro da janela 3-sigma)
-                    if abs(dx) <= std_x_m and abs(dy) <= std_y_m:
-                        valid_detections += 1
-
                 self.filt_pts.append((ex, ey))
 
-                # --- Desenho das anotações (código original mantido) ---
+                # --- RENDERIZAÇÃO GRÁFICA ---
                 ann = frame.copy()
                 if self.show_traj.get() and len(self.filt_pts) >= 2:
                     filt_poly = [self.world_m.world2img(p[0], p[1]) for p in self.filt_pts if p is not None]
@@ -600,33 +622,45 @@ class KalmanApp:
                     if len(meas_poly) >= 2:
                         cv2.polylines(ann, [np.array(meas_poly, dtype=np.int32)], False, GREEN_COLOR, 1)
 
-                if self.show_window.get() and frame_count < len(self.kalman_windows) and P_mat is not None:
-                    cx_m, cy_m = self.filt_pts[frame_count]
-                    px1, py1 = self.world_m.world2img(cx_m - std_x_m, cy_m + std_y_m)
-                    px2, py2 = self.world_m.world2img(cx_m + std_x_m, cy_m - std_y_m)
+                # DESENHA A JANELA DE KALMAN (ROI PREVISTO PARA ESTE FRAME) E O CENTRO
+                if self.show_window.get() and pos_pred is not None:
+                    # Usa a predição e std_innov (S) para desenhar a área esperada
+                    px1, py1 = self.world_m.world2img(pos_pred[0] - std_innov_x_m, pos_pred[1] + std_innov_y_m)
+                    px2, py2 = self.world_m.world2img(pos_pred[0] + std_innov_x_m, pos_pred[1] - std_innov_y_m)
+                    
+                    # Retângulo Verde
                     cv2.rectangle(ann, 
                                   (max(0, min(w, int(px1))), max(0, min(h, int(py1)))),
                                   (max(0, min(w, int(px2))), max(0, min(h, int(py2)))),
-                                  (255, 200, 0), 2)
+                                  (0, 255, 0), 2)
+                    
+                    # Ponto verde bem pequeno no centro do ROI (Predição)
+                    cx, cy = self.world_m.world2img(pos_pred[0], pos_pred[1])
+                    cv2.circle(ann, (int(cx), int(cy)), 2, (0, 255, 0), -1)
 
-                est_px = self.world_m.world2img(ex, ey)
+                # Desenha o Kalman Atualizado (A Posteriori) como bolinha azul
+                est_px = self.world_m.world2img(est_m[0], est_m[1])
                 if self.show_kalman.get():
                     cv2.circle(ann, (int(est_px[0]), int(est_px[1])), 6, BLUE_COLOR, -1)
 
-                if self.show_detect.get() and meas_px is not None:
-                    cv2.circle(ann, (int(meas_px[0]), int(meas_px[1])), 6, (255, 0, 0), -1)
+                # Desenha a Detecção como bolinha (Ciano ou vermelha se estiver fora, opcional no futuro)
+                if self.show_detect.get() and meas_m is not None:
+                    valid_px = self.world_m.world2img(meas_m[0], meas_m[1])
+                    cv2.circle(ann, (int(valid_px[0]), int(valid_px[1])), 6, (255, 0, 0), -1)
 
                 out.write(ann)
                 frame_count += 1
 
-            # Taxas de detecção e inliers
             self.total_frames = frame_count
+            
             self.detection_rate = (frames_with_meas / frame_count * 100.0) if frame_count > 0 else 0.0
-            self.inlier_rate = (valid_detections / frames_with_meas * 100.0) if frames_with_meas > 0 else 0.0
+            self.inlier_rate = (self.meas_inside_roi / frames_with_meas * 100.0) if frames_with_meas > 0 else 0.0
+            
+            self.sensor_detection_rate = self.detection_rate
+            self.roi_accuracy_rate = self.inlier_rate
 
             self.processed_video_path = output_path
             self.root.after(0, self._on_processing_complete)
-
         except Exception as e:
             errorMsg = str(e)
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao processar: {errorMsg}"))
@@ -654,15 +688,14 @@ class KalmanApp:
         if not self.filt_pts or not self.meas_pts:
             messagebox.showwarning("Aviso", "Nenhum resultado para salvar.")
             return
-        
+
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "results"
             save_dir = f"FiltroKalman/src/results/{video_name}"
             os.makedirs(save_dir, exist_ok=True)
-            
+
             # ========== Preparação de dados ==========
-            # Erros assinados (filtrado - medido) para análise de viés e dispersão
             signed_dx = []
             signed_dy = []
             for m_pt, f_pt in zip(self.meas_pts, self.filt_pts):
@@ -670,13 +703,8 @@ class KalmanApp:
                     signed_dx.append(f_pt[0] - m_pt[0])
                     signed_dy.append(f_pt[1] - m_pt[1])
 
-            # Erros absolutos e RMS
-            dx_abs = [abs(e) for e in signed_dx]
-            dy_abs = [abs(e) for e in signed_dy]
-            # NIS válidos (já corrigidos)
             valid_nis = [n for n in self.nis_vals if not np.isnan(n)]
 
-            # Running RMS para análise de convergência
             sx = np.array([v for v in self.sqerr_x if not np.isnan(v)])
             sy = np.array([v for v in self.sqerr_y if not np.isnan(v)])
             run_rms_x = np.sqrt(np.cumsum(sx) / np.arange(1, sx.size + 1)) if sx.size > 0 else []
@@ -704,7 +732,6 @@ class KalmanApp:
             if len(run_rms_x) > 0:
                 ax2.plot(run_rms_x, label="RMS X", color="blue")
                 ax2.plot(run_rms_y, label="RMS Y", color="orange")
-                # Marca pontos de convergência
                 final_x = run_rms_x[-1] if len(run_rms_x) > 0 else None
                 final_y = run_rms_y[-1] if len(run_rms_y) > 0 else None
                 conv_idx_x = self._find_convergence_frame(run_rms_x, final_x)
@@ -734,7 +761,7 @@ class KalmanApp:
             ax3.grid(True, alpha=0.3, linestyle="--")
             fig3.savefig(f"{save_dir}/{video_name}_3_scatter.png")
 
-            # ===== GRÁFICO 4: NIS (CORRIGIDO) =====
+            # ===== GRÁFICO 4: NIS =====
             fig4 = Figure(figsize=(12, 6), tight_layout=True, dpi=150)
             ax4 = fig4.add_subplot(111)
             frames_nis = [i for i, n in enumerate(self.nis_vals) if not np.isnan(n)]
@@ -777,7 +804,8 @@ class KalmanApp:
             nis_above_95 = sum(1 for n in valid_nis if n > 5.99)
             nis_pct_above = (nis_above_95 / len(valid_nis)) * 100 if valid_nis else 0.0
 
-            # Tempo de convergência (frames -> segundos)
+            conv_idx_x = self._find_convergence_frame(run_rms_x, run_rms_x[-1] if len(run_rms_x) else None)
+            conv_idx_y = self._find_convergence_frame(run_rms_y, run_rms_y[-1] if len(run_rms_y) else None)
             conv_time_x = conv_idx_x / self.fps if conv_idx_x is not None else None
             conv_time_y = conv_idx_y / self.fps if conv_idx_y is not None else None
 
@@ -792,7 +820,6 @@ class KalmanApp:
                 f.write(f"Total de Frames: {self.total_frames}\n")
                 f.write(f"FPS: {self.fps:.2f}\n\n")
 
-                # Parâmetros do filtro
                 fmt_opts = {'precision': 6, 'suppress_small': True, 'separator': '  '}
                 f.write("--- PARÂMETROS DO FILTRO ---\n")
                 if hasattr(self, 'saved_Q') and self.saved_Q is not None:
@@ -860,32 +887,31 @@ class KalmanApp:
             self.root.after(0, lambda: messagebox.showerror("Erro", f"Erro ao gerar relatórios: {error_msg}"))
         finally:
             self.processing = False
-
+            
     def _on_processing_complete(self):
         """Seletor de interface chamado ao finalizar o processamento."""
-        self.status_lbl.config(text=f"Status: Concluído | Detecção: {self.detection_rate:.1f}%")
+        self.status_lbl.config(text=f"Status: Concluído | Detecção: {self.inlier_rate:.1f}%")
         self.exec_btn.config(state="normal")
         self.load_btn.config(state="normal")
-        
+
         if self.processed_video_path:
             self.cap = cv2.VideoCapture(self.processed_video_path)
             self.video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.current_frame_idx = 0
-            
+
             ret, frame = self.cap.read()
             if ret:
                 self.tela_viewer.display_image(frame)
                 total_time = self.total_frames / self.video_fps
                 self.time_info_lbl.config(text=f"00:00 / {self._format_time(total_time)}")
-            
+
             self.prev_btn.config(state="normal")
             self.play_btn.config(state="normal")
             self.next_btn.config(state="normal")
             self.save_btn.config(state="normal")
-            
-            self._update_metrics_plots()
 
+            self._update_metrics_plots()
     def toggle_playback(self):
         if not self.cap:
             return
