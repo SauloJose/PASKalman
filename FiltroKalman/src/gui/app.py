@@ -45,7 +45,7 @@ class KalmanApp:
         self.towers = None 
 
         #Tamanho mínimo do ROI 
-        self.min_window_m = int(self.max_x/40) #metros
+        self.min_window_m = int(self.max_x/60) #metros
 
         # Maximize window
         try:
@@ -164,7 +164,7 @@ class KalmanApp:
         q_frame.pack(fill="x", pady=(0, 1))
         
         q_labels = ["Q[0,0]", "Q[1,1]", "Q[2,2]", "Q[3,3]", "Q[4,4]", "Q[5,5]"]
-        default_q_vals = ["5e-1", "5e-1", "5e-1", "5e-1", "5e-1", "5e-1"]
+        default_q_vals = ["5", "5", "5", "5", "5", "5"]
         
         self.q_entries = []
         for i, label in enumerate(q_labels):
@@ -188,7 +188,7 @@ class KalmanApp:
         r_frame.pack(fill="x", pady=(0, 1))
         
         r_labels = ["R[0,0]", "R[1,1]"]
-        default_r_vals = ["1e-2", "1e-2"]
+        default_r_vals = ["1e-1", "1e-1"]
         
         self.r_entries = []
         for i, label in enumerate(r_labels):
