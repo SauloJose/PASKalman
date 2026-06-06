@@ -131,13 +131,13 @@ class KalmanApp:
 
         # ===== SECTION 1: Carregar o vídeo =====
         entrada_lbl_frame = tk.LabelFrame(self.left_frame, text="📄 Carregar o vídeo", 
-                                        font=("Segoe UI", 9, "bold"), 
-                                        bg="#f5f5f5", fg="#333333", padx=8, pady=2)
+                                         font=("Segoe UI", 9, "bold"), 
+                                         bg="#f5f5f5", fg="#333333", padx=8, pady=2)
         entrada_lbl_frame.pack(fill="x", padx=8, pady=1)
 
         self.video_path_label = tk.Label(entrada_lbl_frame, text="Nenhum vídeo (Ou Arena Sintética)", 
-                                        wraplength=260, font=("Segoe UI", 8), 
-                                        fg="#666666", bg="#f5f5f5")
+                                         wraplength=260, font=("Segoe UI", 8), 
+                                         fg="#666666", bg="#f5f5f5")
         self.video_path_label.pack(anchor="w", pady=(1, 2))
 
         self.load_btn = tk.Button(entrada_lbl_frame, text="📁 Load Vídeo", command=self.load_video, 
@@ -147,8 +147,8 @@ class KalmanApp:
 
         # ===== SECTION 2: Opções do Filtro =====
         config_lbl_frame = tk.LabelFrame(self.left_frame, text="⚙ Opções do Filtro & Sensor", 
-                                        font=("Segoe UI", 9, "bold"), 
-                                        bg="#f5f5f5", fg="#333333", padx=8, pady=2)
+                                         font=("Segoe UI", 9, "bold"), 
+                                         bg="#f5f5f5", fg="#333333", padx=8, pady=2)
         config_lbl_frame.pack(fill="x", padx=8, pady=1)
 
         self.detector_noise_entry = ttk.Entry(config_lbl_frame, width=10)
@@ -239,7 +239,6 @@ class KalmanApp:
                                  font=("Segoe UI", 8), fg="#4b5563", bg="#f5f5f5")
         self.rmse_lbl.pack(anchor="w", pady=1)
 
-        # NOVA LABEL: Erro Médio (Viés) em X e Y
         self.mean_err_lbl = tk.Label(info_lbl_frame, text="Erro Médio (X | Y): -- | -- m", 
                                      font=("Segoe UI", 8), fg="#4b5563", bg="#f5f5f5")
         self.mean_err_lbl.pack(anchor="w", pady=1)
@@ -247,6 +246,11 @@ class KalmanApp:
         self.nis_lbl = tk.Label(info_lbl_frame, text="NIS Médio: --", 
                                font=("Segoe UI", 8), fg="#4b5563", bg="#f5f5f5")
         self.nis_lbl.pack(anchor="w", pady=1)
+
+        # ADICIONADO: Nova label para Regime Estacionário
+        self.steady_state_lbl = tk.Label(info_lbl_frame, text="Regime Estacionário: -- s (-- frames)", 
+                                        font=("Segoe UI", 8), fg="#4b5563", bg="#f5f5f5")
+        self.steady_state_lbl.pack(anchor="w", pady=1)
 
         # ===== SPACER: Garante o uso de todo o height útil =====
         spacer = tk.Frame(self.left_frame, bg="white")
@@ -540,7 +544,7 @@ class KalmanApp:
         O erro do detector é lido em metros e convertido para pixels."""
         import numpy as np
 
-        # 1. Parse Q from individual entries (Proteção contra None ou lista vazia)
+        # 1. Parse Q from individual entries
         q_vals = []
         entries_q = getattr(self, 'q_entries', [])
         if entries_q:
@@ -554,11 +558,10 @@ class KalmanApp:
                 else:
                     q_vals.append(1e-2)
         
-        # Garante tamanho mínimo caso q_entries esteja vazia
         while len(q_vals) < 6:
             q_vals.append(1e-2)
         
-        # 2. Parse R from individual entries (Proteção contra None ou lista vazia)
+        # 2. Parse R from individual entries
         r_vals = []
         entries_r = getattr(self, 'r_entries', [])
         if entries_r:
@@ -591,7 +594,7 @@ class KalmanApp:
             if towers_temp:
                 self.towers = np.array(towers_temp)
             
-        # 4. Obtém o erro digitado na interface em METROS (Proteção contra entry nula)
+        # 4. Obtém o erro digitado na interface em METROS
         erro_metros = 1.0
         if hasattr(self, 'detector_noise_entry') and self.detector_noise_entry is not None:
             try:
@@ -608,11 +611,11 @@ class KalmanApp:
         px_m_x = v_width / max_x
         px_m_y = v_height / max_y
         
-        # 5. Salva o ruído nas DUAS métricas (Pixels e Metros)
+        # 5. Salva o ruído nas DUAS métricas
         self.config_detector_noise = px_m_x * erro_metros   
         self.config_detector_noise_m = erro_metros          
 
-        # 6. Atualiza a label da dashboard se ela já existir e NÃO for None
+        # 6. Atualiza a label da dashboard
         if hasattr(self, 'erro_sensor_lbl') and self.erro_sensor_lbl is not None:
             avg_scale_px_m = (px_m_x + px_m_y) / 2.0
             erro_px = erro_metros * avg_scale_px_m
@@ -634,7 +637,6 @@ class KalmanApp:
             try: self.inlier_rate_lbl.config(text="Inliers (na Janela): --%", fg="#4b5563")
             except Exception: pass
             
-        # Reseta visualmente as labels adicionadas recentemente no painel esquerdo
         if hasattr(self, 'rmse_lbl') and self.rmse_lbl is not None:
             try: self.rmse_lbl.config(text="RMSE (X | Y): -- | -- m", fg="#4b5563")
             except Exception: pass
@@ -646,15 +648,24 @@ class KalmanApp:
         if hasattr(self, 'nis_lbl') and self.nis_lbl is not None:
             try: self.nis_lbl.config(text="NIS Médio: --", fg="#4b5563")
             except Exception: pass
+
+        # ADICIONADO: Limpa a label de Regime Estacionário
+        if hasattr(self, 'steady_state_lbl') and self.steady_state_lbl is not None:
+            try: self.steady_state_lbl.config(text="Regime Estacionário: -- s (-- frames)", fg="#4b5563")
+            except Exception: pass
             
         # Cria ou reseta as variáveis internas utilizadas no processamento
         self.current_inliers = 0.0
         self.current_detected = 0.0
+        
+        # ADICIONADO: Variáveis de estado do Filtro para convergência
+        self.steady_state_reached = False
+        self.steady_state_frame = -1
 
         # 8. Salva as configurações das matrizes
         self.config_Q = q_vals[:6]  
         self.config_R = r_vals[:2]
-        
+
     def _process_video(self):
         """Process video with Kalman filter and save to src/data/."""
         cap = None 
@@ -693,8 +704,8 @@ class KalmanApp:
             self.sqerr_y = []
             self.kalman_windows = []
             self.nis_vals = []
-            self.innov_x = []           
-            self.innov_y = []           
+            self.innov_x = []            
+            self.innov_y = []            
 
             while True:
                 ret, frame = cap.read()
@@ -752,6 +763,26 @@ class KalmanApp:
                 # 3. GUARDAR ESTADOS FINAIS (A Posteriori)
                 est_m = kf.get_position()
                 P_mat = kf.P.copy() if hasattr(kf, 'P') else None
+
+                # ========== CÁLCULO DO REGIME ESTACIONÁRIO ==========
+                if not getattr(self, 'steady_state_reached', False) and P_mat is not None and len(self.kalman_windows) > 0:
+                    P_prev = self.kalman_windows[-1]
+                    if P_prev is not None:
+                        # Verifica a variação através do traço da diferença absoluta das matrizes
+                        variacao_P = np.trace(np.abs(P_mat - P_prev))
+                        if variacao_P < 1e-2:
+                            self.steady_state_reached = True
+                            self.steady_state_frame = frame_count
+                            tempo_segundos = frame_count / self.fps
+                            
+                            # Dispara a atualização visual na Thread principal
+                            self.root.after(0, lambda f=frame_count, t=tempo_segundos: 
+                                self.steady_state_lbl.config(
+                                    text=f"Regime Estacionário: {t:.2f} s ({f} frames)", 
+                                    fg="#1e3a8a", font=("Segoe UI", 8, "bold")
+                                ) if hasattr(self, 'steady_state_lbl') else None
+                            )
+                
                 self.kalman_windows.append(P_mat)
 
                 if meas_m is None:
@@ -801,7 +832,7 @@ class KalmanApp:
                 out.write(ann)
                 frame_count += 1
 
-            # ========== [MUDANÇA AQUI] CÁLCULO CENTRALIZADO DE MÉTRICAS ==========
+            # ========== CÁLCULO CENTRALIZADO DE MÉTRICAS ==========
             self.total_frames = frame_count
             self.detection_rate = (frames_with_meas / frame_count * 100.0) if frame_count > 0 else 0.0
             self.inlier_rate = (self.meas_inside_roi / frames_with_meas * 100.0) if frames_with_meas > 0 else 0.0
